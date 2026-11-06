@@ -9,6 +9,19 @@ services:
     container_name: vevor-weatherbridge
     restart: unless-stopped
     env_file: .env
+    # Hardening: the app runs as uid 10001 with only CAP_NET_BIND_SERVICE (see docker-entrypoint.sh).
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # HTTP on port 80
+      - CHOWN              # entrypoint: hand ./data over to the app user
+      - SETUID             # entrypoint: drop root
+      - SETGID
     volumes:
       - ./data:/data
     labels:
