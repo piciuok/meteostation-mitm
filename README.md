@@ -551,6 +551,39 @@ Code layout:
   `data/last_request_wc.json`. WC values are not mapped to HA yet.
 * Upload interval: about every 30 s according to upstream issue #8 (YT60233).
 
+## Contributing and repository security
+
+All changes reach `main` through pull requests that the owner reviews and merges
+(`.github/CODEOWNERS`). Dependency updates (GitHub Actions, pip, Docker base image) come
+from Dependabot as pull requests as well; nothing is merged automatically. Security issues:
+see [SECURITY.md](SECURITY.md).
+
+In the repository:
+
+* Third-party GitHub Actions are pinned to commit SHAs (the version is in a comment);
+  Dependabot proposes updates.
+* Workflows run with read-only `GITHUB_TOKEN` by default; only the image job gets
+  `packages: write` and only on pushes to `main` / `v*` tags. Pull requests (also from
+  forks) run tests only, without secrets.
+* Ready-to-import rulesets: [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json)
+  (no deletion or force push of `main`, changes via pull request, CI job `test` must pass;
+  repository admins may bypass) and
+  [`.github/rulesets/protect-release-tags.json`](.github/rulesets/protect-release-tags.json)
+  (only admins create, move or delete `v*` tags, which publish versioned images).
+
+Repository settings to apply in the GitHub UI (owner only):
+
+| Where | Setting |
+|---|---|
+| Settings → Rules → Rulesets → New ruleset → **Import a ruleset** | import both JSON files above |
+| Settings → Actions → General → Fork pull request workflows | **Require approval for all external contributors** |
+| Settings → Actions → General → Workflow permissions | **Read repository contents and packages permissions**; untick *Allow GitHub Actions to create and approve pull requests* |
+| Settings → Advanced Security (Code security) | enable **Private vulnerability reporting**, **Dependabot alerts**, **Dependabot security updates**, **Secret scanning** + **Push protection** |
+| Settings → General → Features | enable **Issues** (the ESPHome compatibility workflow reports failures there); disable **Wiki** / **Projects** if unused |
+| Settings → General → Pull Requests | enable **Automatically delete head branches** |
+| GitHub → Settings → Applications → Installed GitHub Apps | limit third-party apps (e.g. Claude) to the repositories they need; with the `main` ruleset they can only propose pull requests |
+| GHCR package → Package settings | link the package to this repository; only this repository's workflow publishes it |
+
 ## License
 
 [CC0 1.0 Universal](LICENSE).

@@ -44,8 +44,8 @@ jobs:
       matrix:
         target: [pinned, ha-stable, ha-dev, esphome, latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Resolve aioesphomeapi version
@@ -84,6 +84,11 @@ jobs:
           REASON: ${{ inputs.reason }}
         run: |
           title="ESPHome compatibility check failed"
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]; then
+            echo "::warning::Issues are disabled in this repository; not opening an issue. See $RUN_URL"
+            echo "Issues are disabled in this repository, so no issue was opened. Enable them in Settings → General → Features to get failure reports." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number -q '.[0].number')
           body="The ESPHome compatibility run failed: $RUN_URL"
           if [ -n "$REASON" ]; then body="$body"$'\n\n'"Trigger: $REASON"; fi
