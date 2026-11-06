@@ -205,7 +205,7 @@ async def test_toggle_forward_via_mqtt_and_restart(make_cfg, upstream):
     # "restart": new state from disk, env defaults say True but state.json wins
     state2 = ProxyState(cfg.data_dir, {"wu": True, "wc": True})
     assert state2.forward("wu") is False and state2.forward("wc") is False
-    app = create_app(cfg, start_mqtt=False)
+    app = create_app(cfg, start_backends=False)
     assert app[STATE].forward("wu") is False
 
 

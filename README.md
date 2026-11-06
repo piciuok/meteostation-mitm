@@ -6,7 +6,10 @@ cloud. It:
 
 1. **Intercepts** the console's uploads to Weather Underground (WU) and Weathercloud (WC)
    (the router's DNS points both hostnames at this container).
-2. **Publishes** the WU data to Home Assistant via **MQTT discovery** (metric units).
+2. **Publishes** the WU data to Home Assistant (metric units) through one or both backends:
+   * **ESPHome Native API**: the container acts as an ESPHome device; HA adds it with the
+     built-in ESPHome integration, no MQTT broker needed. Plaintext or encrypted (Noise key).
+   * **MQTT discovery** through a broker (e.g. the Mosquitto add-on).
 3. **Forwards** the original request to the real service and returns the **original
    response** to the console, recording it.
 4. When forwarding is **off** or the upstream **fails**, answers the console with the
@@ -24,9 +27,9 @@ flowchart LR
   C[VEVOR console] -- "HTTP GET (DNS → 192.168.10.200)" --> P[weatherbridge container]
   P -- "forward ON: original request<br/>resolved via UPSTREAM_DNS" --> WU[rtupdate.wunderground.com]
   P -- "forward ON" --> WC[api.weathercloud.net]
-  P -- "MQTT discovery + state" --> M[(Mosquitto)]
-  M --> HA[Home Assistant]
-  HA -- "switch commands" --> M --> P
+  P -- "ESPHome Native API :6053" --> HA[Home Assistant]
+  P -- "MQTT discovery + state (optional)" --> M[(Mosquitto)]
+  M --> HA
   P -. "data/responses/*.json<br/>(mock when OFF / upstream down)" .-> P
 ```
 
@@ -66,10 +69,40 @@ the console's response.
 
 ---
 
+## Home Assistant backends
+
+Both backends are **off by default**; enable at least one in `.env` (the container exits with a
+configuration error otherwise). Enabling both is possible but creates two HA devices with the
+same data.
+
+| | ESPHome (`ESPHOME_ENABLED=true`) | MQTT (`MQTT_ENABLED=true`) |
+|---|---|---|
+| Needs | nothing besides HA | MQTT broker + HA MQTT integration |
+| Add in HA | **Settings → Devices & services → Add integration → ESPHome**, host = container IP, port 6053 (or accept the auto-discovered device via mDNS) | automatic (MQTT discovery) |
+| Encryption | optional, `ESPHOME_ENCRYPTION_KEY` (base64, 32 bytes) like ESPHome `api.encryption.key` | broker TLS/auth |
+| Protocol | ESPHome Native API (protobuf over TCP), implemented here as a server | official HA MQTT discovery |
+| New weather field appears | HA is asked to reconnect and re-lists entities (a few seconds) | entity announced on the fly |
+
+### ESPHome backend notes
+
+* The protobuf messages come from the pinned [`aioesphomeapi`](https://github.com/esphome/aioesphomeapi)
+  package, the same client library Home Assistant uses; the tests connect with that client
+  (plaintext and Noise, wrong key, plaintext/encrypted mismatch, switch commands).
+* The device reports API version 1.14, a fixed name (`ESPHOME_NAME`) and a fixed MAC
+  (`ESPHOME_MAC`, by default derived from `DEVICE_ID`, locally administered). HA uses the MAC
+  as the device's unique id, so do not change name or MAC after adding the device.
+* Sensors are listed once their WU field has been received at least once (persisted in
+  `data/state.json`), so fields the console never sends do not show up as `unknown`.
+* `last_reading` and the upstream statuses are text sensors (timestamp as ISO-8601).
+* mDNS (`ESPHOME_MDNS=true`) advertises `_esphomelib._tcp` for auto-discovery. If discovery
+  does not work in your network, add the device by IP; mDNS is not required.
+* The Native API is not a formally versioned public protocol. A future HA/ESPHome release may
+  need an `aioesphomeapi` bump here; MQTT discovery is the more stable option.
+
 ## Home Assistant entities
 
-One device: `identifiers: [weather_station]`, name `Weather Station`, model `VEVOR YT60234`
-(configurable). Entity IDs below assume `DEVICE_ID=weather_station`.
+One device named `Weather Station`, model `VEVOR YT60234` (configurable). Entity IDs below
+assume `DEVICE_NAME=Weather Station` and are the same for both backends.
 
 | Entity | WU field | Unit | device_class | state_class |
 |---|---|---|---|---|
@@ -102,10 +135,10 @@ One device: `identifiers: [weather_station]`, name `Weather Station`, model `VEV
   Values are rounded to 0.1, humidity and wind direction to integers.
 * WU field names are matched **case-insensitively** (the YT60234 sends `solarRadiation`).
 * Values `-9999`, empty and `NaN` are skipped (not published).
-* `last_reading` attributes: request counters, upstream error counters, `last_seen_*`,
+* MQTT only: `last_reading` attributes: request counters, upstream error counters, `last_seen_*`,
   forward state, `wu_fields` (names received) and `wu_unmapped` (unknown names, no values).
 * No `weather.*` entity and no forecast are created; that is a separate step in HA.
-* Entity IDs come from `default_entity_id` in the discovery payload (HA 2025.10+). The entity
+* MQTT: entity IDs come from `default_entity_id` in the discovery payload (HA 2025.10+). The entity
   names also slugify to the same IDs (`Humidity` → `humidity`), so the result is the same
   on older versions.
 
@@ -140,13 +173,20 @@ every variable). `docker-compose.yml` only wires the environment together and co
 |---|---|---|
 | `DOCKER_NETWORK` | `br0` | external Docker network (compose interpolation) |
 | `CONTAINER_IP` | `192.168.10.200` | fixed container IP (compose interpolation) |
-| `MQTT_HOST` / `MQTT_PORT` | – / `1883` | broker; empty host = run without HA |
+| `ESPHOME_ENABLED` | `false` | ESPHome Native API backend |
+| `ESPHOME_PORT` | `6053` | Native API port |
+| `ESPHOME_NAME` | `weather-station` | ESPHome device name (a-z, 0-9, `-`) |
+| `ESPHOME_MAC` | derived from `DEVICE_ID` | MAC reported to HA (device unique id) |
+| `ESPHOME_ENCRYPTION_KEY` | – | base64 32-byte Noise key (`openssl rand -base64 32`); empty = plaintext |
+| `ESPHOME_MDNS` | `true` | advertise the device via mDNS |
+| `MQTT_ENABLED` | `false` | MQTT discovery backend |
+| `MQTT_HOST` / `MQTT_PORT` | – / `1883` | broker (required when MQTT is enabled) |
 | `MQTT_USER` / `MQTT_PASSWORD` | – | broker credentials |
 | `FORWARD_WU` / `FORWARD_WC` | `true` | initial forward state (state saved by an HA toggle wins) |
 | `UPSTREAM_DNS` | `1.1.1.1,9.9.9.9` | resolvers for upstream hosts |
 | `UPSTREAM_TIMEOUT` | `8` | upstream timeout in seconds |
 | `WU_USERNAME` / `WU_PASSWORD` | – | optionally override the station ID/key sent to WU |
-| `DEVICE_ID` / `DEVICE_NAME` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `weather_station` / `Weather Station` / `VEVOR YT60234` / `VEVOR` | HA device |
+| `DEVICE_ID` / `DEVICE_NAME` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `weather_station` / `Weather Station` / `VEVOR YT60234` / `VEVOR` | HA device (both backends) |
 | `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
 | `BASE_TOPIC` | `meteo_proxy` | state / status / command topics |
 | `UNITS` | `metric` | `imperial` publishes the raw WU units (°F, mph, in, inHg) |
@@ -169,7 +209,7 @@ every variable). `docker-compose.yml` only wires the environment together and co
   parser error that quotes the raw request line.
 * Logging: one INFO line per request (`WU: 14 fields → HA, forward 200`). Upstream failures
   and fallbacks to the recorded response are logged at WARNING.
-* `GET /healthz` returns JSON: `ok`, `mqtt_connected`, forward state, counters, `last_seen`,
+* `GET /healthz` returns JSON: `ok`, enabled backends, `mqtt_connected`, `esphome_clients`, forward state, counters, `last_seen`,
   last upstream statuses. The image `HEALTHCHECK` uses it. The container stays healthy while
   MQTT is down, because serving the console is the critical path.
 
@@ -190,7 +230,7 @@ cd /mnt/user/appdata
 git clone https://github.com/piciuok/meteostation-mitm.git vevor-weatherbridge
 cd vevor-weatherbridge
 cp .env.example .env
-nano .env        # set MQTT_PASSWORD (and check MQTT_HOST, CONTAINER_IP, DOCKER_NETWORK)
+nano .env        # enable a backend (ESPHOME_ENABLED and/or MQTT_ENABLED), check CONTAINER_IP, DOCKER_NETWORK
 docker network ls   # confirm the ipvlan network name (br0)
 ```
 
@@ -229,7 +269,14 @@ curl -s -H 'Host: rtupdate.wunderground.com' 'http://192.168.10.200/weatherstati
 ```
 
 Expected: `success` (or the recorded WU response). Then check `data/last_request_wu.json`
-(ID/PASSWORD shown as `***`) and the `Weather Station` device in HA.
+(ID/PASSWORD shown as `***`).
+
+**ESPHome backend:** in HA go to **Settings → Devices & services**. Either confirm the
+discovered `weather-station` device, or **Add integration → ESPHome**, host `192.168.10.200`,
+port `6053`, and enter `ESPHOME_ENCRYPTION_KEY` when asked (only if you set one). The
+`Weather Station` device appears with the sensors received so far.
+
+**MQTT backend:** the `Weather Station` device appears in the MQTT integration automatically.
 
 ### 4. Redirect the console to the container (DNS)
 
@@ -417,10 +464,20 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-The tests use a local fake upstream HTTP server and a fake MQTT client. They cover
-conversions, case-insensitive fields, WC path parsing, masking across logs, files and MQTT,
-forward on/off, upstream down or timeout, MQTT switch toggling with persistence, and
-discovery payloads.
+The tests use a local fake upstream HTTP server, a fake MQTT client and the real
+`aioesphomeapi` client. They cover conversions, case-insensitive fields, WC path parsing,
+masking across logs, files and MQTT, forward on/off, upstream down or timeout, MQTT and ESPHome
+switch toggling with persistence, MQTT discovery payloads, and the ESPHome Native API
+(plaintext, Noise, wrong key, entity list, state push, re-list on new fields).
+
+CI:
+
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | push, PR, `v*` tags | `pytest`, then builds and pushes the image to GHCR (push to `main` / tags) |
+| `esphome-compat.yml` | weekly (Mon 04:17 UTC), manual, changes to the ESPHome code | ESPHome tests against `aioesphomeapi` versions: `pinned` (requirements), `ha-stable` (pinned by the latest Home Assistant release), `ha-dev` (HA dev branch), `latest` (PyPI). A failed scheduled run opens or updates the issue "ESPHome compatibility check failed". |
+
+Check the versions locally with `python scripts/esphome_versions.py ha-stable`.
 
 Code layout:
 
@@ -430,7 +487,8 @@ Code layout:
 | `weatherbridge/app.py` | aiohttp app, request handling, forward/mock |
 | `weatherbridge/parsing.py` | WU field table + conversions, WC parsing, masking helpers |
 | `weatherbridge/upstream.py` | resolver via `UPSTREAM_DNS`, forwarder, recorded responses |
-| `weatherbridge/mqtt.py` | HA discovery, state publishing, switch commands, reconnect |
+| `weatherbridge/mqtt.py` | MQTT backend: HA discovery, state publishing, switch commands, reconnect |
+| `weatherbridge/esphome.py` | ESPHome backend: Native API server (plaintext/Noise), entities, mDNS |
 | `weatherbridge/state.py` | runtime state + `data/state.json` |
 | `weatherbridge/logsafe.py` | global log scrubbing of credentials |
 
@@ -438,6 +496,9 @@ Code layout:
 
 ## Known issues / open questions
 
+* **ESPHome Native API** is implemented by this project on top of `aioesphomeapi`'s protobuf
+  definitions; it is not an official ESPHome device. The weekly `esphome-compat` workflow
+  tests it against the version Home Assistant uses.
 * **Garbage solar radiation from the console** (upstream issue #9). Some consoles send
   malformed values such as `solarRadiation=-117.-5`. Reportedly, values above about 367 W/m²
   wrap to negative. One reporter fixed it by having VEVOR replace the console (display unit).

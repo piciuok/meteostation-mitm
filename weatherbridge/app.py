@@ -11,6 +11,7 @@ from aiohttp.abc import AbstractResolver
 
 from . import logsafe
 from .config import Config
+from .esphome import ESPHomeServer
 from .mqtt import HABridge
 from .parsing import (WC_SECRET_KEYS, WU_SECRET_KEYS, mask_query, mask_wc_path, parse_wc,
                       parse_wu, query_pairs, redact, replace_query_values, secrets_from_query,
@@ -28,6 +29,7 @@ SVC_LABEL = {"wu": "WU", "wc": "WC"}
 CFG = web.AppKey("cfg", Config)
 STATE = web.AppKey("state", ProxyState)
 BRIDGE = web.AppKey("bridge", HABridge)
+ESPHOME = web.AppKey("esphome", object)  # ESPHomeServer | None
 FORWARDER = web.AppKey("forwarder", Forwarder)
 STORE = web.AppKey("store", ResponseStore)
 TASKS = web.AppKey("tasks", set)
@@ -53,6 +55,13 @@ def upstream_host(svc: str, host: str) -> str:
     if host.endswith(HOST_SUFFIXES[svc]):
         return host
     return DEFAULT_HOSTS[svc]
+
+
+def notify_backends(app: web.Application) -> None:
+    """Push the current state to every enabled Home Assistant backend (in the background)."""
+    _spawn(app, app[BRIDGE].publish_update())
+    if app[ESPHOME] is not None:
+        _spawn(app, app[ESPHOME].publish_update())
 
 
 def _spawn(app: web.Application, coro) -> None:
@@ -178,7 +187,7 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
         state.save()
 
     log.info("%s: %s, %s", SVC_LABEL[svc], summary, outcome)
-    _spawn(app, app[BRIDGE].publish_update())
+    notify_backends(app)
 
     ctype = resp.content_type.split(";")[0].strip() or "text/plain"
     charset = None
@@ -189,9 +198,14 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
 
 async def handle_health(request: web.Request) -> web.Response:
     state = request.app[STATE]
+    cfg = request.app[CFG]
+    esphome = request.app[ESPHOME]
     return web.json_response({
         "ok": True,
+        "mqtt_enabled": cfg.mqtt_enabled,
         "mqtt_connected": request.app[BRIDGE].connected,
+        "esphome_enabled": cfg.esphome_enabled,
+        "esphome_clients": len([c for c in esphome.clients if c.subscribed]) if esphome else 0,
         "forward": {"wu": state.forward("wu"), "wc": state.forward("wc")},
         "requests": state.requests,
         "upstream_errors": state.upstream_errors,
@@ -202,7 +216,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def create_app(cfg: Config, resolver: AbstractResolver | None = None,
-               start_mqtt: bool = True) -> web.Application:
+               start_backends: bool = True) -> web.Application:
     logsafe.install()
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     app = web.Application()
@@ -210,7 +224,9 @@ def create_app(cfg: Config, resolver: AbstractResolver | None = None,
     state = ProxyState(cfg.data_dir, {"wu": cfg.forward_wu, "wc": cfg.forward_wc})
     app[STATE] = state
     app[STORE] = ResponseStore(cfg.data_dir)
-    app[BRIDGE] = HABridge(cfg, state)
+    app[BRIDGE] = HABridge(cfg, state, on_change=lambda: notify_backends(app))
+    app[ESPHOME] = (ESPHomeServer(cfg, state, on_forward_change=lambda: notify_backends(app))
+                    if cfg.esphome_enabled else None)
     app[FORWARDER] = Forwarder(resolver or UpstreamResolver(cfg.upstream_dns), cfg.upstream_timeout,
                                cfg.upstream_port)
     app[TASKS] = set()
@@ -219,7 +235,11 @@ def create_app(cfg: Config, resolver: AbstractResolver | None = None,
     app.router.add_route("*", "/{tail:.*}", handle_upload)
 
     async def lifecycle(app: web.Application):
-        mqtt_task = asyncio.create_task(app[BRIDGE].run()) if start_mqtt else None
+        mqtt_task = None
+        if start_backends and cfg.mqtt_enabled:
+            mqtt_task = asyncio.create_task(app[BRIDGE].run())
+        if start_backends and app[ESPHOME] is not None:
+            await app[ESPHOME].start()
         log.info("Forward WU=%s WC=%s, upstream DNS %s", state.forward("wu"), state.forward("wc"),
                  ",".join(cfg.upstream_dns))
         yield
@@ -233,6 +253,8 @@ def create_app(cfg: Config, resolver: AbstractResolver | None = None,
         if mqtt_task:
             mqtt_task.cancel()
             await asyncio.gather(mqtt_task, return_exceptions=True)
+        if app[ESPHOME] is not None:
+            await app[ESPHOME].stop()
         for t in list(app[TASKS]):
             t.cancel()
         await app[FORWARDER].close()
@@ -245,6 +267,13 @@ def main() -> None:
     cfg = Config.from_env()
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    errors = cfg.validate()
+    if errors:
+        for err in errors:
+            log.error("Configuration error: %s", err)
+        raise SystemExit(2)
+    log.info("Backends: MQTT=%s ESPHome=%s", "on" if cfg.mqtt_enabled else "off",
+             "on" if cfg.esphome_enabled else "off")
     # Never log raw request lines (they contain station credentials).
     logging.getLogger("aiohttp.access").disabled = True
     web.run_app(create_app(cfg), host=cfg.http_host, port=cfg.http_port, access_log=None,

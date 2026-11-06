@@ -185,15 +185,13 @@ class HABridge:
                 self.state.set_forward(svc, enabled)
                 log.info("Forward %s set to %s from MQTT", svc.upper(), "ON" if enabled else "OFF")
                 if self.on_change:
-                    self.on_change()
-                await self.publish_state()
+                    self.on_change()  # publishes to all backends, this one included
+                else:
+                    await self.publish_state()
                 return
 
     # ------------------------------------------------------------------ connection loop
     async def run(self) -> None:
-        if not self.cfg.mqtt_host:
-            log.warning("MQTT_HOST not set: running without Home Assistant integration")
-            return
         import aiomqtt
 
         backoff = 1.0

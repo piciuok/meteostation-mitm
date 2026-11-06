@@ -96,7 +96,7 @@ def make_cfg(tmp_path):
 @pytest.fixture
 def make_client(aiohttp_client):
     async def _make(cfg):
-        app = create_app(cfg, resolver=StaticResolver("127.0.0.1"), start_mqtt=False)
+        app = create_app(cfg, resolver=StaticResolver("127.0.0.1"), start_backends=False)
         fake = FakeMQTT()
         app[BRIDGE].client = fake
         client = await aiohttp_client(app)

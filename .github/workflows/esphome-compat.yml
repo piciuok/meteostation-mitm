@@ -1,0 +1,73 @@
+name: ESPHome compatibility
+
+# Checks the ESPHome Native API backend against the aioesphomeapi versions that matter:
+#   pinned    - our requirements.txt
+#   ha-stable - what the latest Home Assistant release uses to talk to this container
+#   ha-dev    - what the next Home Assistant release will use
+#   latest    - newest aioesphomeapi on PyPI (early warning, server code built against it)
+# The tests start our ESPHome server and connect with the real aioesphomeapi client.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays 04:17 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "weatherbridge/esphome.py"
+      - "tests/test_esphome.py"
+      - "requirements*.txt"
+      - "scripts/esphome_versions.py"
+      - ".github/workflows/esphome-compat.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pinned, ha-stable, ha-dev, latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve aioesphomeapi version
+        id: ver
+        run: |
+          v=$(python scripts/esphome_versions.py ${{ matrix.target }})
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "### ${{ matrix.target }}: aioesphomeapi $v" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install
+        run: |
+          pip install -r requirements-dev.txt
+          pip install "aioesphomeapi==${{ steps.ver.outputs.version }}"
+          pip show aioesphomeapi | head -2
+      - name: ESPHome backend tests
+        run: pytest -q tests/test_esphome.py
+      - name: Full test suite
+        run: pytest -q
+
+  report:
+    needs: compat
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="ESPHome compatibility check failed"
+          num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number -q '.[0].number')
+          body="The scheduled ESPHome compatibility run failed: $RUN_URL"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
