@@ -1,594 +1,524 @@
-# VEVOR Weatherbridge – local WU / Weathercloud proxy for Home Assistant
+# VEVOR Weatherbridge
 
-A small Dockerized service that sits between a VEVOR weather station console (tested target:
-**YT60234**, works with any console speaking the Weather Underground upload protocol) and the
-cloud. It:
+[![CI](https://github.com/piciuok/meteostation-mitm/actions/workflows/ci.yml/badge.svg)](https://github.com/piciuok/meteostation-mitm/actions/workflows/ci.yml)
+[![ESPHome compatibility](https://github.com/piciuok/meteostation-mitm/actions/workflows/esphome-compat.yml/badge.svg)](https://github.com/piciuok/meteostation-mitm/actions/workflows/esphome-compat.yml)
 
-1. **Intercepts** the console's uploads to Weather Underground (WU) and Weathercloud (WC)
-   (the router's DNS points both hostnames at this container).
-2. **Publishes** the WU data to Home Assistant (metric units) through one or both backends:
-   * **ESPHome Native API**: the container acts as an ESPHome device; HA adds it with the
-     built-in ESPHome integration, no MQTT broker needed. Plaintext or encrypted (Noise key).
-   * **MQTT discovery** through a broker (e.g. the Mosquitto add-on).
-3. **Forwards** the original request to the real service and returns the **original
-   response** to the console, recording it.
-4. When forwarding is **off** or the upstream **fails**, answers the console with the
-   **recorded response** (mock), so the console never sees an error caused by the proxy.
-5. Forwarding is switchable **at runtime from Home Assistant** (one switch for WU, one for WC).
+Local proxy for VEVOR weather station consoles (tested: **YT60234**; any console using the
+Weather Underground upload protocol). It intercepts the console's uploads to Weather
+Underground (WU) and Weathercloud (WC) and brings the data into **Home Assistant**, with or
+without the cloud.
+
+* **Home Assistant** as an **ESPHome device** (no broker needed) and/or via **MQTT discovery**,
+  in metric units.
+* **Forward or mock**: uploads are passed on to WU/WC and the real answer goes back to the
+  console. When forwarding is off or the cloud is down, the console gets a recorded answer
+  and never sees an error.
+* **Switchable at runtime** from Home Assistant, separately for WU and WC.
+* Station credentials are masked in logs, files and MQTT; the container runs unprivileged.
 
 Forked from [C9H13NO3-dev/VevorWeatherbridge](https://github.com/C9H13NO3-dev/VevorWeatherbridge) (CC0-1.0).
 
----
+## Contents
+
+* [Screenshots](#screenshots)
+* [How it works](#how-it-works)
+* [Quick start](#quick-start)
+* [Home Assistant](#home-assistant)
+  * [Choosing a backend](#choosing-a-backend)
+  * [Entities](#entities)
+  * [Pressure trend package](#pressure-trend-package)
+* [Configuration](#configuration)
+* [Redirecting the console (DNS)](#redirecting-the-console-dns)
+* [Deployment notes](#deployment-notes)
+* [Operations](#operations)
+* [Security](#security)
+* [Troubleshooting and known issues](#troubleshooting-and-known-issues)
+* [Development](#development)
+* [Contributing](#contributing)
+* [License](#license)
 
 ## Screenshots
 
-Real deployment (UnRAID, ipvlan `br0`, both backends enabled for comparison).
-
-| | |
+| ESPHome device in Home Assistant | MQTT device in Home Assistant |
 |---|---|
-| ![ESPHome device in Home Assistant](docs/screenshots/02-ha-esphome-device.png) | ![MQTT device in Home Assistant](docs/screenshots/04-ha-mqtt-device.png) |
-| ESPHome backend: device info (firmware 2.0.0, MAC), sensors, activity with upstream status 200 | MQTT backend: the same data as an MQTT discovery device (model VEVOR YT60234) |
-| ![Forward switches and diagnostics](docs/screenshots/03-ha-esphome-controls-diagnostics.png) | ![/healthz](docs/screenshots/01-healthz.png) |
-| Forward switches (WU, Weathercloud) and diagnostics (last reading, upstream statuses) | `GET /healthz`: MQTT connected, 1 ESPHome client, request counters, upstream 200/200 |
+| ![ESPHome device](docs/screenshots/02-ha-esphome-device.png) | ![MQTT device](docs/screenshots/04-ha-mqtt-device.png) |
+
+<details>
+<summary>More: switches and diagnostics, <code>/healthz</code>, UnRAID</summary>
+
+| Forward switches and diagnostics | `GET /healthz` |
+|---|---|
+| ![Switches and diagnostics](docs/screenshots/03-ha-esphome-controls-diagnostics.png) | ![healthz](docs/screenshots/01-healthz.png) |
 
 ![UnRAID container row](docs/screenshots/05-unraid-container.png)
 
-UnRAID Docker view: Compose stack, `br0`, `192.168.10.200`, `data` volume, healthy.
+</details>
 
----
-
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-  C[VEVOR console] -- "HTTP GET (DNS → 192.168.10.200)" --> P[weatherbridge container]
-  P -- "forward ON: original request<br/>resolved via UPSTREAM_DNS" --> WU[rtupdate.wunderground.com]
+  C[VEVOR console] -- "HTTP upload (DNS points to the container)" --> P[weatherbridge]
+  P -- "forward ON" --> WU[rtupdate.wunderground.com]
   P -- "forward ON" --> WC[api.weathercloud.net]
   P -- "ESPHome Native API :6053" --> HA[Home Assistant]
-  P -- "MQTT discovery + state (optional)" --> M[(Mosquitto)]
-  M --> HA
-  P -. "data/responses/*.json<br/>(mock when OFF / upstream down)" .-> P
+  P -- "MQTT discovery (optional)" --> M[(MQTT broker)] --> HA
 ```
 
-| Request | Recognised by | Parsed into HA | Forwarded to |
-|---|---|---|---|
-| `GET /weatherstation/updateweatherstation.php?...` (any path under `/weatherstation/`) | path, or `Host: *.wunderground.com` | yes | `Host` if it is a `wunderground.com` host, else `rtupdate.wunderground.com` |
-| `GET /v01/set/wid/<id>/key/<key>/<name>/<value>/...` | path (`/v01/`, `/v1/`), or `Host: *.weathercloud.net` | no (diagnostics only) | `Host` if it is a `weathercloud.net` host, else `api.weathercloud.net` |
-| `GET /healthz` | – | – | – |
-| anything else | – | – | **404**, logged (masked) at INFO |
-
-The proxy only ever forwards to the service's own domain. It never forwards to an arbitrary
-`Host` header, so it cannot act as an open proxy.
-
-### Forward / mock logic
+1. Your DNS server answers `rtupdate.wunderground.com` and `api.weathercloud.net` with the
+   container's IP, so the console uploads to the container (plain HTTP, port 80).
+2. The WU upload is parsed, converted to metric and published to Home Assistant.
+   Weathercloud data is only kept for diagnostics.
+3. The request is forwarded to the real service and the console gets its response, or the
+   recorded response when forwarding is off or fails:
 
 | Situation | Console receives | Recorded |
 |---|---|---|
-| Forward ON, upstream 2xx | upstream status, body, content-type | yes → `data/responses/<wu\|wc>.json` |
-| Forward ON, upstream 3xx/4xx (e.g. wrong station key) | upstream response unchanged | no |
-| Forward ON, upstream 5xx, network error, DNS error, timeout | recorded response (or default) | no |
-| Forward OFF | recorded response (or default) | no |
+| Forward ON, upstream 2xx | upstream response | yes, in `data/responses/` |
+| Forward ON, upstream 3xx/4xx (e.g. wrong station key) | upstream response | no |
+| Forward ON, upstream 5xx, timeout, network or DNS error | recorded response | no |
+| Forward OFF | recorded response | no |
 
-Defaults until something is recorded: WU `200 text/html "success\n"`, WC `200 text/plain "200"`.
+Until something is recorded, the defaults are WU `success` and WC `200`. Upstream hosts are
+resolved only through `UPSTREAM_DNS` (default `1.1.1.1,9.9.9.9`), never through your LAN DNS,
+which points them back at the container.
 
-**Upstream DNS:** upstream hosts are resolved **only** via `UPSTREAM_DNS` (default
-`1.1.1.1,9.9.9.9`), never via the system / router resolver. The router resolves those
-names to this container, so using it would create a loop.
+## Quick start
 
-### Framework change (Flask → aiohttp)
+Requirements: Docker with Compose, and a LAN IP for the container on which it can listen on
+port 80 (macvlan/ipvlan network, or a host whose port 80 is free).
 
-The upstream project used Flask with a fire-and-forget `requests` call and a write-only
-paho client. This fork needs three things running at once: an upstream request whose
-response goes back to the console, a long-lived MQTT subscription for the switches, and
-reconnects with backoff. `aiohttp` + `aiomqtt` handle all three in one asyncio loop without
-threads. The ESPHome Native API server runs in the same loop. Publishing to Home Assistant
-runs in the background, so a slow or absent broker/client never delays the console's response.
+1. **Get the code and configure**
 
----
+   ```bash
+   git clone https://github.com/piciuok/meteostation-mitm.git vevor-weatherbridge
+   ```
 
-## Home Assistant backends
+   ```bash
+   cd vevor-weatherbridge && cp .env.example .env
+   ```
 
-Both backends are **off by default**; enable at least one in `.env` (the container exits with a
-configuration error otherwise). Enabling both is possible but creates two HA devices with the
-same data.
+   In `.env` enable at least one backend (`ESPHOME_ENABLED=true` and/or `MQTT_ENABLED=true`)
+   and set `DOCKER_NETWORK` / `CONTAINER_IP`. Every variable is described in
+   [`.env.example`](.env.example).
 
-| | ESPHome (`ESPHOME_ENABLED=true`) | MQTT (`MQTT_ENABLED=true`) |
+2. **Start** (local build; for the prebuilt image see [Deployment notes](#deployment-notes))
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. **Check** from another machine in the LAN (`192.168.1.200` = your `CONTAINER_IP`)
+
+   ```bash
+   curl -s http://192.168.1.200/healthz
+   ```
+
+   ```bash
+   curl -s -H 'Host: rtupdate.wunderground.com' 'http://192.168.1.200/weatherstation/updateweatherstation.php?ID=X&PASSWORD=Y&tempf=50'
+   ```
+
+   The second command returns `success`.
+
+4. **Add to Home Assistant**
+   * ESPHome: **Settings → Devices & services**, confirm the discovered `weather-station`
+     device, or **Add integration → ESPHome** with the container IP and port `6053`.
+   * MQTT: the device appears automatically.
+
+5. **Point the console at the container**: add the DNS entries described in
+   [Redirecting the console (DNS)](#redirecting-the-console-dns), then power-cycle the console.
+
+## Home Assistant
+
+### Choosing a backend
+
+Both backends are off by default. The container refuses to start until at least one is
+enabled. Enabling both creates two devices with the same data.
+
+| | ESPHome (`ESPHOME_ENABLED`) | MQTT (`MQTT_ENABLED`) |
 |---|---|---|
-| Needs | nothing besides HA | MQTT broker + HA MQTT integration |
-| Add in HA | **Settings → Devices & services → Add integration → ESPHome**, host = container IP, port 6053 (or accept the auto-discovered device via mDNS) | automatic (MQTT discovery) |
-| Encryption | optional, `ESPHOME_ENCRYPTION_KEY` (base64, 32 bytes) like ESPHome `api.encryption.key` | broker TLS/auth |
-| Protocol | ESPHome Native API (protobuf over TCP), implemented here as a server | official HA MQTT discovery |
-| New weather field appears | HA is asked to reconnect and re-lists entities (a few seconds) | entity announced on the fly |
+| Needs | Home Assistant only | MQTT broker + MQTT integration |
+| Adding the device | ESPHome integration (mDNS discovery or by IP, port 6053) | automatic discovery |
+| Encryption | `ESPHOME_ENCRYPTION_KEY`, like `api.encryption.key` in ESPHome | broker TLS / credentials |
+| Values | float32, rounded by HA for display only | exact |
+| Stability | protocol emulated by this project, [tested weekly](#development) | official HA MQTT discovery |
 
-### ESPHome backend notes
+<details>
+<summary>ESPHome backend details</summary>
 
-* The protobuf messages come from the pinned [`aioesphomeapi`](https://github.com/esphome/aioesphomeapi)
-  package, the same client library Home Assistant uses; the tests connect with that client
-  (plaintext and Noise, wrong key, plaintext/encrypted mismatch, switch commands).
-* The device reports API version 1.14, a fixed name (`ESPHOME_NAME`) and a fixed MAC
-  (`ESPHOME_MAC`, by default derived from `DEVICE_ID`, locally administered). HA uses the MAC
-  as the device's unique id, so do not change name or MAC after adding the device.
-* Sensors are listed once their WU field has been received at least once (persisted in
-  `data/state.json`), so fields the console never sends do not show up as `unknown`.
-* `last_reading` and the upstream statuses are text sensors (timestamp as ISO-8601).
-* mDNS (`ESPHOME_MDNS=true`) advertises `_esphomelib._tcp` for auto-discovery. If discovery
-  does not work in your network, add the device by IP; mDNS is not required.
-* The Native API is not a formally versioned public protocol. A future HA/ESPHome release may
-  need an `aioesphomeapi` bump here; MQTT discovery is the more stable option.
+* Protobuf messages come from the pinned [`aioesphomeapi`](https://github.com/esphome/aioesphomeapi),
+  the client library Home Assistant uses; the tests connect with that client.
+* The device has a fixed name (`ESPHOME_NAME`) and MAC (`ESPHOME_MAC`, derived from
+  `DEVICE_ID` by default). HA uses the MAC as the device id, so keep both stable.
+* Sensors appear once their field has been received at least once. When a new field
+  appears, HA is asked to reconnect and re-reads the entity list (a few seconds).
+* Without `ESPHOME_ENCRYPTION_KEY` anyone in the LAN can connect and toggle forwarding.
+  Generate a key with `openssl rand -base64 32`.
 
-## Home Assistant entities
+</details>
 
-One device named `Weather Station`, model `VEVOR YT60234` (configurable). Entity IDs below
-assume `DEVICE_NAME=Weather Station` and are the same for both backends.
-
-| Entity | WU field | Unit | device_class | state_class |
-|---|---|---|---|---|
-| `sensor.weather_station_temperature` | tempf | °C | temperature | measurement |
-| `sensor.weather_station_humidity` | humidity | % | humidity | measurement |
-| `sensor.weather_station_dew_point` | dewptf | °C | temperature | measurement |
-| `sensor.weather_station_wind_chill` | windchillf | °C | temperature | measurement |
-| `sensor.weather_station_indoor_temperature` | indoortempf | °C | temperature | measurement |
-| `sensor.weather_station_indoor_humidity` | indoorhumidity | % | humidity | measurement |
-| `sensor.weather_station_wind_speed` | windspeedmph | km/h | wind_speed | measurement |
-| `sensor.weather_station_wind_gust` | windgustmph | km/h | wind_speed | measurement |
-| `sensor.weather_station_wind_direction` | winddir | ° | – (mdi:compass) | – |
-| `sensor.weather_station_rain_rate` | rainin | mm/h | precipitation_intensity | measurement |
-| `sensor.weather_station_daily_rain` | dailyrainin | mm | precipitation | total_increasing |
-| `sensor.weather_station_weekly_rain` | weeklyrainin | mm | precipitation | total_increasing |
-| `sensor.weather_station_monthly_rain` | monthlyrainin | mm | precipitation | total_increasing |
-| `sensor.weather_station_yearly_rain` | yearlyrainin | mm | precipitation | total_increasing |
-| `sensor.weather_station_solar_radiation` | solarradiation | W/m² | irradiance | measurement |
-| `sensor.weather_station_uv_index` | UV | – | – | measurement |
-| `sensor.weather_station_relative_pressure` | baromin | hPa | atmospheric_pressure | measurement |
-| `sensor.weather_station_absolute_pressure` | absbaromin | hPa | atmospheric_pressure | measurement |
-| `sensor.weather_station_last_reading` | – | timestamp, diagnostic | | |
-| `sensor.weather_station_upstream_wu_status` | – | last HTTP code or `error`, diagnostic | | |
-| `sensor.weather_station_upstream_wc_status` | – | last HTTP code or `error`, diagnostic | | |
-| `switch.weather_station_forward_to_wu` | – | forward to WU, config | | |
-| `switch.weather_station_forward_to_weathercloud` | – | forward to Weathercloud, config | | |
-
-* Weather sensors are announced the first time their field arrives.
-* Conversions: °C = (°F − 32)·5/9, km/h = mph·1.609344, mm = in·25.4, hPa = inHg·33.8639.
-  Values are rounded to 0.1, humidity and wind direction to integers.
-* WU field names are matched **case-insensitively** (the YT60234 sends `solarRadiation`).
-* Values `-9999`, empty and `NaN` are skipped (not published).
-* MQTT only: `last_reading` attributes: request counters, upstream error counters, `last_seen_*`,
-  forward state, `wu_fields` (names received) and `wu_unmapped` (unknown names, no values).
-* No `weather.*` entity and no forecast are created; that is a separate step in HA.
-* MQTT: entity IDs come from `default_entity_id` in the discovery payload (HA 2025.10+). The entity
-  names also slugify to the same IDs (`Humidity` → `humidity`), so the result is the same
-  on older versions.
-
-### Home Assistant package (optional)
-
-[`homeassistant/weather_station.yaml`](homeassistant/weather_station.yaml) adds
-`sensor.weather_station_pressure_change_3h` (statistics `change` over 3 h of the relative
-pressure). Copy it to `/config/packages/` (requires `packages: !include_dir_named packages`
-under `homeassistant:` in `configuration.yaml`), check the configuration and restart HA.
-
-### MQTT topics
+<details>
+<summary>MQTT topics</summary>
 
 | Topic | Content |
 |---|---|
-| `meteo_proxy/state` | single JSON state (retained); all entities read it via `value_template` |
-| `meteo_proxy/status` | `online` / `offline` (LWT, retained) |
-| `meteo_proxy/forward/wu/set`, `meteo_proxy/forward/wc/set` | switch commands `ON` / `OFF` |
-| `homeassistant/status` | subscribed; on `online` discovery and state are re-published |
+| `meteo_proxy/state` | one retained JSON state; all entities read it via `value_template` |
+| `meteo_proxy/status` | `online` / `offline` (LWT) |
+| `meteo_proxy/forward/wu/set`, `…/wc/set` | switch commands `ON` / `OFF` |
+| `homeassistant/status` | on `online`, discovery and state are published again |
 | `homeassistant/<sensor\|switch>/weather_station/<key>/config` | discovery (retained) |
 
-The last values are accumulated and persisted in `data/state.json`. A request that lacks some
-field does not break the templates of entities announced earlier, and values survive a restart.
+`meteo_proxy` is `BASE_TOPIC`, `homeassistant` is `DISCOVERY_PREFIX`, `weather_station` is
+`DEVICE_ID`.
 
----
+</details>
+
+### Entities
+
+Entity IDs below assume `DEVICE_NAME=Weather Station`; they are the same for both backends.
+
+| Entity | WU field | Unit |
+|---|---|---|
+| `sensor.weather_station_temperature` | `tempf` | °C |
+| `sensor.weather_station_humidity` | `humidity` | % |
+| `sensor.weather_station_dew_point` | `dewptf` | °C |
+| `sensor.weather_station_wind_chill` | `windchillf` | °C |
+| `sensor.weather_station_indoor_temperature` | `indoortempf` | °C |
+| `sensor.weather_station_indoor_humidity` | `indoorhumidity` | % |
+| `sensor.weather_station_wind_speed` | `windspeedmph` | km/h |
+| `sensor.weather_station_wind_gust` | `windgustmph` | km/h |
+| `sensor.weather_station_wind_direction` | `winddir` | ° |
+| `sensor.weather_station_rain_rate` | `rainin` | mm/h |
+| `sensor.weather_station_daily_rain` / `weekly_rain` / `monthly_rain` / `yearly_rain` | `dailyrainin` … `yearlyrainin` | mm |
+| `sensor.weather_station_solar_radiation` | `solarradiation` | W/m² |
+| `sensor.weather_station_uv_index` | `UV` | – |
+| `sensor.weather_station_relative_pressure` | `baromin` | hPa |
+| `sensor.weather_station_absolute_pressure` | `absbaromin` | hPa |
+| `sensor.weather_station_last_reading` | – | timestamp (diagnostic) |
+| `sensor.weather_station_upstream_wu_status` / `upstream_wc_status` | – | last HTTP code or `error` (diagnostic) |
+| `switch.weather_station_forward_to_wu` / `forward_to_weathercloud` | – | forwarding on/off |
+
+<details>
+<summary>Parsing rules</summary>
+
+* Conversions: °C = (°F − 32)·5/9, km/h = mph·1.609344, mm = in·25.4, hPa = inHg·33.8639.
+  Rounded to 0.1; humidity and wind direction to integers. `UNITS=imperial` keeps WU units.
+* Field names are case-insensitive (the YT60234 sends `solarRadiation`).
+* `-9999`, empty and `NaN` values are skipped. Garbage values (e.g. `-117.-5`) and negative
+  values of non-negative quantities are rejected and listed in `data/last_request_wu.json`.
+* Unknown fields are listed (names only) in `data/last_request_wu.json` and, with MQTT, in
+  the attributes of `last_reading`.
+* Device classes and state classes follow HA conventions (rain totals are `total_increasing`).
+* No `weather.*` entity or forecast is created.
+
+</details>
+
+### Pressure trend package
+
+[`homeassistant/weather_station.yaml`](homeassistant/weather_station.yaml) adds
+`sensor.weather_station_pressure_change_3h`. Copy it to `/config/packages/` (needs
+`packages: !include_dir_named packages` under `homeassistant:`) and restart HA.
 
 ## Configuration
 
-All configuration goes in `.env` (copy from [`.env.example`](.env.example), which documents
-every variable). `docker-compose.yml` only wires the environment together and contains no secrets.
+Everything is set in `.env`; [`.env.example`](.env.example) documents each variable.
+The compose files contain no secrets.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DOCKER_NETWORK` | `br0` | external Docker network (compose interpolation) |
-| `CONTAINER_IP` | `192.168.10.200` | fixed container IP (compose interpolation) |
-| `ESPHOME_ENABLED` | `false` | ESPHome Native API backend |
-| `ESPHOME_PORT` | `6053` | Native API port |
-| `ESPHOME_NAME` | `weather-station` | ESPHome device name (a-z, 0-9, `-`) |
-| `ESPHOME_MAC` | derived from `DEVICE_ID` | MAC reported to HA (device unique id) |
-| `ESPHOME_ENCRYPTION_KEY` | – | base64 32-byte Noise key (`openssl rand -base64 32`); empty = plaintext |
-| `ESPHOME_MDNS` | `true` | advertise the device via mDNS |
-| `MQTT_ENABLED` | `false` | MQTT discovery backend |
-| `MQTT_HOST` / `MQTT_PORT` | – / `1883` | broker (required when MQTT is enabled) |
-| `MQTT_USER` / `MQTT_PASSWORD` | – | broker credentials |
-| `FORWARD_WU` / `FORWARD_WC` | `true` | initial forward state (state saved by an HA toggle wins) |
-| `UPSTREAM_DNS` | `1.1.1.1,9.9.9.9` | resolvers for upstream hosts |
-| `UPSTREAM_TIMEOUT` | `8` | upstream timeout in seconds |
-| `WU_USERNAME` / `WU_PASSWORD` | – | optionally override the station ID/key sent to WU |
-| `DEVICE_ID` / `DEVICE_NAME` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `weather_station` / `Weather Station` / `VEVOR YT60234` / `VEVOR` | HA device (both backends) |
-| `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
-| `BASE_TOPIC` | `meteo_proxy` | state / status / command topics |
-| `UNITS` | `metric` | `imperial` publishes the raw WU units (°F, mph, in, inHg) |
-| `HTTP_PORT` | `80` | HTTP port inside the container |
-| `DATA_DIR` | `/data` | data directory inside the container |
-| `TZ` | – | container time zone (logs) |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `ESPHOME_ENABLED` / `MQTT_ENABLED` | `false` | Home Assistant backends (enable at least one) |
+| `ESPHOME_ENCRYPTION_KEY` | – | Noise key (base64, 32 bytes); empty = plaintext |
+| `ESPHOME_NAME` / `ESPHOME_MAC` / `ESPHOME_PORT` / `ESPHOME_MDNS` | `weather-station` / derived / `6053` / `true` | ESPHome device |
+| `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASSWORD` | – / `1883` / – / – | MQTT broker |
+| `DEVICE_NAME` / `DEVICE_ID` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `Weather Station` / `weather_station` / `VEVOR YT60234` / `VEVOR` | HA device |
+| `DISCOVERY_PREFIX` / `BASE_TOPIC` | `homeassistant` / `meteo_proxy` | MQTT topics |
+| `FORWARD_WU` / `FORWARD_WC` | `true` | initial forwarding; a toggle from HA is remembered |
+| `UPSTREAM_DNS` / `UPSTREAM_TIMEOUT` | `1.1.1.1,9.9.9.9` / `8` | upstream resolvers, timeout in seconds |
+| `WU_USERNAME` / `WU_PASSWORD` | – | override the station ID/key sent to WU |
+| `UNITS` | `metric` | `imperial` keeps WU units |
+| `DOCKER_NETWORK` / `CONTAINER_IP` | `br0` / `192.168.1.200` | used by the compose files only |
+| `TZ` / `LOG_LEVEL` | – / `INFO` | time zone, log level |
+| `HTTP_PORT` / `DATA_DIR` | `80` / `/data` | inside the container |
 
-### Data directory (`./data` → `/data`)
+Files in `./data`:
 
 | File | Content |
 |---|---|
-| `state.json` | forward switch state set from HA, last sensor values |
-| `responses/wu.json`, `responses/wc.json` | last successful upstream response (`status`, `content_type`, `body`, `recorded_at`) |
-| `last_request_wu.json`, `last_request_wc.json` | last request (masked): host, path, query, UA, parsed values, `unmapped_fields`, rejected values, response source |
+| `state.json` | forwarding state set from HA, last sensor values |
+| `responses/wu.json`, `responses/wc.json` | last successful upstream response (used as the mock) |
+| `last_request_wu.json`, `last_request_wc.json` | last request, masked: fields, unknown/rejected fields, response source |
 
-### Security and logging
+## Redirecting the console (DNS)
 
-* `ID`, `PASSWORD` (WU query) and `wid`, `key` (WC path/query) are replaced with `***` in
-  logs, `data/` files and MQTT. Full URLs are never logged. aiohttp's access log is disabled.
-  A global log filter also scrubs these keys from third-party log records, e.g. aiohttp's
-  parser error that quotes the raw request line.
-* Logging: one INFO line per request (`WU: 14 fields → HA, forward 200`). Upstream failures
-  and fallbacks to the recorded response are logged at WARNING.
-* `GET /healthz` returns JSON: `ok`, enabled backends, `mqtt_connected`, `esphome_clients`,
-  forward state, counters, `last_seen`, last upstream statuses. The image `HEALTHCHECK` uses
-  it. The container stays healthy while MQTT is down, because serving the console is the
-  critical path.
+Make the DNS server your console uses answer both hostnames with the container IP. Then
+power-cycle the console (it caches DNS).
 
-### Hardening
+Before you start:
 
-| Area | Measure |
-|---|---|
-| Forwarding | Only to the service's own domain: the `Host` header is normalised (bare DNS name, no path/userinfo) and must be the domain or a subdomain of `wunderground.com` / `weathercloud.net`, otherwise the default host is used. The proxy cannot be used to reach other hosts. |
-| Upstream | Response bodies over 64 KiB are treated as an upstream error (mock served, nothing recorded). Upstream DNS only via `UPSTREAM_DNS`. |
-| ESPHome API | Optional Noise encryption (recommended: without a key anyone in the LAN can connect and toggle the forward switches). HelloRequest must come first and within 10 s, idle clients are dropped after 120 s, at most 8 connections, clients that do not read their data are dropped. |
-| MQTT | Use a dedicated HA user (`meteo_proxy`); restrict it with Mosquitto ACLs to `meteo_proxy/#` and `homeassistant/#` if your broker supports it. `DEVICE_ID`, `BASE_TOPIC`, `DISCOVERY_PREFIX` are validated (no wildcards or separators). |
-| Container | The entrypoint hands `/data` to uid 10001 and drops root via `setpriv`; the app keeps only `CAP_NET_BIND_SERVICE` (port 80). The compose files add `read_only`, `no-new-privileges` and `cap_drop: ALL` (+ the four caps the entrypoint needs). Data written by older root-run versions is re-owned on start. |
-| Secrets | Only in `.env` (git-ignored): `MQTT_PASSWORD`, `ESPHOME_ENCRYPTION_KEY`, optional `WU_PASSWORD`. Station credentials from the console are masked everywhere. |
-| CI | Version strings from PyPI/GitHub are validated before use in shell steps; workflow inputs reach `run:` blocks only through `env`. |
+* The console must use that DNS server (normally the router, via DHCP). If it ignores DHCP,
+  see *Console with a hard-coded DNS server* below.
+* The upload must be plain HTTP. Check your router's connection list: if the console talks
+  to WU on port 443, it cannot be intercepted.
+* Most methods match the exact hostname only. Add every name the console uses (check your
+  resolver's log or cache).
 
----
-
-## Deployment (UnRAID)
-
-Target: UnRAID host with Docker + Compose Manager. The container gets its own LAN IP on the
-ipvlan network (`br0`), so it can listen on port 80 without clashing with the host.
-
-> **ipvlan caveat:** the UnRAID host itself cannot reach containers on the ipvlan network.
-> Run all tests (`curl`) from **another machine** in the LAN.
-
-### 1. Get the code and configure
-
-```bash
-cd /mnt/user/appdata
-git clone https://github.com/piciuok/meteostation-mitm.git vevor-weatherbridge
-cd vevor-weatherbridge
-cp .env.example .env
-nano .env        # enable a backend (ESPHOME_ENABLED and/or MQTT_ENABLED), check CONTAINER_IP, DOCKER_NETWORK
-docker network ls   # confirm the ipvlan network name (br0)
-```
-
-### 2a. Run, local build
-
-```bash
-docker compose up -d --build
-```
-
-The image is tagged `vevor-weatherbridge:local` and labelled `wud.watch=false`, so WUD ignores it.
-
-### 2b. Run, prebuilt image from GHCR
-
-CI publishes `ghcr.io/piciuok/meteostation-mitm` (`latest` from `main`, `X.Y.Z` / `X.Y` from `v*` tags).
-WUD can track this image.
-
-```bash
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
-```
-
-If the package is private, run `docker login ghcr.io` on the host first, or make the package
-public in the GitHub package settings.
-
-With Compose Manager, point the stack at `/mnt/user/appdata/vevor-weatherbridge`, or paste
-the content of the chosen compose file. `.env` is read from the same directory.
-
-### 3. Verify (from another LAN machine)
-
-```bash
-curl -s http://192.168.10.200/healthz
-```
-
-```bash
-curl -s -H 'Host: rtupdate.wunderground.com' 'http://192.168.10.200/weatherstation/updateweatherstation.php?ID=X&PASSWORD=Y&tempf=50&solarRadiation=100&baromin=29.92'
-```
-
-Expected: `success` (or the recorded WU response). Then check `data/last_request_wu.json`
-(ID/PASSWORD shown as `***`).
-
-**ESPHome backend:** in HA go to **Settings → Devices & services**. Either confirm the
-discovered `weather-station` device, or **Add integration → ESPHome**, host `192.168.10.200`,
-port `6053`, and enter `ESPHOME_ENCRYPTION_KEY` when asked (only if you set one). The
-`Weather Station` device appears with the sensors received so far.
-
-**MQTT backend:** the `Weather Station` device appears in the MQTT integration automatically.
-
-### 4. Redirect the console to the container (DNS)
-
-The console resolves `rtupdate.wunderground.com` (and `api.weathercloud.net` if Weathercloud is
-enabled on it) through the DNS server it got via DHCP. Make that DNS server answer both names
-with the container IP. Pick **one** of the variants below. Examples use `192.168.10.200`.
-
-Check before you start:
-
-* The console must use the DNS server you change (normally the router, handed out by DHCP).
-  If it has a hard-coded DNS server, see [Console with a hard-coded DNS server](#console-with-a-hard-coded-dns-server).
-* The upload must be plain HTTP (port 80). Check the router's connection table or a packet
-  capture. If WU goes over 443/HTTPS, it cannot be intercepted this way.
-* Hosts-style entries (Pi-hole, OpenWrt Hostnames, OPNsense/pfSense overrides, MikroTik static)
-  match the **exact** name only. Add every hostname the console really uses (check the DNS log
-  or cache of your resolver).
-
-Verify from any LAN machine that uses the same DNS server:
+Check from any machine using the same DNS server; the answer must be the container IP:
 
 ```bash
 nslookup rtupdate.wunderground.com
 ```
 
-Expected answer: `192.168.10.200`. Then power-cycle the console (it caches DNS) and watch
-`docker logs -f vevor-weatherbridge` for `WU: … fields → HA` lines.
+<details>
+<summary>Pi-hole v6</summary>
 
-#### Variant A: local DNS server (Pi-hole, AdGuard Home)
-
-Use this when your router cannot create custom DNS records (e.g. AVM FRITZ!Box, stock ASUS
-firmware, consumer TP-Link Archer/Deco). Hand out the Pi-hole/AdGuard IP as DNS server in the
-router's DHCP settings.
-
-**Pi-hole v6** ([docs](https://docs.pi-hole.net/ftldns/configfile/#hosts)):
-UI **Settings → Local DNS Records**, add both names with `192.168.10.200`. CLI equivalent
-(replaces the whole `dns.hosts` list, so include your existing entries):
+UI: **Settings → Local DNS Records**, add both names with the container IP. CLI (replaces the
+whole list, include existing entries; in Docker use `FTLCONF_dns_hosts`):
 
 ```bash
-sudo pihole-FTL --config dns.hosts '[ "192.168.10.200 rtupdate.wunderground.com api.weathercloud.net" ]'
+sudo pihole-FTL --config dns.hosts '[ "192.168.1.200 rtupdate.wunderground.com api.weathercloud.net" ]'
 ```
 
-In the Pi-hole Docker image the same key is set with the `FTLCONF_dns_hosts` environment variable.
+[Pi-hole docs](https://docs.pi-hole.net/ftldns/configfile/#hosts)
 
-**AdGuard Home** ([docs](https://adguard-dns.io/kb/adguard-home/faq/)):
-UI **Filters → DNS rewrites → Add DNS rewrite**: domain `rtupdate.wunderground.com`, answer
-`192.168.10.200`; the same for `api.weathercloud.net`. YAML equivalent in `AdGuardHome.yaml`
-(edit only while AdGuard Home is stopped, otherwise it overwrites the file):
+</details>
+
+<details>
+<summary>AdGuard Home</summary>
+
+UI: **Filters → DNS rewrites → Add DNS rewrite**, one per hostname. Or in `AdGuardHome.yaml`
+(edit while AdGuard Home is stopped):
 
 ```yaml
 filtering:
   rewrites:
     - domain: rtupdate.wunderground.com
-      answer: 192.168.10.200
+      answer: 192.168.1.200
       enabled: true
     - domain: api.weathercloud.net
-      answer: 192.168.10.200
+      answer: 192.168.1.200
       enabled: true
 ```
 
-**Plain dnsmasq** ([man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html)), then restart dnsmasq:
+[AdGuard Home docs](https://adguard-dns.io/kb/adguard-home/faq/)
+
+</details>
+
+<details>
+<summary>dnsmasq / Asuswrt-Merlin</summary>
+
+Add to the dnsmasq configuration (Merlin: `/jffs/configs/dnsmasq.conf.add`, with
+**Administration → System → Enable JFFS custom scripts and configs**), then restart dnsmasq
+(Merlin: `service restart_dnsmasq`):
 
 ```
-address=/rtupdate.wunderground.com/192.168.10.200
-address=/api.weathercloud.net/192.168.10.200
+address=/rtupdate.wunderground.com/192.168.1.200
+address=/api.weathercloud.net/192.168.1.200
 ```
 
-`address=` also matches subdomains. Since dnsmasq 2.86 queries of another type (AAAA) for these
-names are forwarded upstream; add `local=/rtupdate.wunderground.com/` (and the same for
-Weathercloud) if the console uses IPv6.
+`address=` also matches subdomains. If the console uses IPv6, also add
+`local=/rtupdate.wunderground.com/` (dnsmasq ≥ 2.86 forwards AAAA queries otherwise).
+[dnsmasq man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html),
+[Merlin wiki](https://github.com/RMerl/asuswrt-merlin.ng/wiki/Custom-domains-with-dnsmasq)
 
-#### Variant B: router with local DNS records
+</details>
 
-**OpenWrt** (LuCI, OpenWrt 25.12: **Network → DNS → DNS Records → Hostnames**; 24.10:
+<details>
+<summary>OpenWrt</summary>
+
+LuCI: **Network → DNS → DNS Records → Hostnames** (OpenWrt 25.12; in 24.10 under
 **Network → DHCP and DNS**). CLI:
 
 ```bash
-uci add dhcp domain
-uci set dhcp.@domain[-1].name='rtupdate.wunderground.com'
-uci set dhcp.@domain[-1].ip='192.168.10.200'
-uci add dhcp domain
-uci set dhcp.@domain[-1].name='api.weathercloud.net'
-uci set dhcp.@domain[-1].ip='192.168.10.200'
-uci commit dhcp
-/etc/init.d/dnsmasq restart
-```
-
-DNS rebind protection (on by default) only filters private IPs in *upstream* answers, local
-entries are not affected.
-
-**OPNsense** ([docs](https://docs.opnsense.org/manual/unbound.html)):
-**Services → Unbound DNS → Overrides → Host overrides → +**: Host `rtupdate`, Domain
-`wunderground.com`, Type A, IP `192.168.10.200`; then Host `api`, Domain `weathercloud.net`. Apply.
-
-**pfSense** ([docs](https://docs.netgate.com/pfsense/en/latest/services/dns/resolver-host-overrides.html)):
-**Services → DNS Resolver → General Settings → Host Overrides → Add**: Host `rtupdate`,
-Domain `wunderground.com`, IP `192.168.10.200`; the same for `api` / `weathercloud.net`.
-Save, Apply Changes. Only clients using the firewall as DNS are affected.
-
-**UniFi Network** ([help article](https://help.ui.com/hc/en-us/articles/15179064940439)):
-Network 9.4+: **Settings → Policy Table → Create New Policy → DNS**, type **Host (A)**, domain
-`rtupdate.wunderground.com`, IP `192.168.10.200` (Network 9.3: **Settings → Policy Engine → DNS**).
-Repeat for `api.weathercloud.net`. Clients must use the gateway as DNS.
-
-**TP-Link Omada** ([docs](https://support.omadanetworks.com/us/document/40077/), controller
-5.15.20+ with an Omada gateway): **Network Config → Network Settings → LAN → LAN DNS**, type
-**IP**, both names → `192.168.10.200`.
-
-**ASUS with Asuswrt-Merlin** ([wiki](https://github.com/RMerl/asuswrt-merlin.ng/wiki/Custom-domains-with-dnsmasq)):
-enable **Administration → System → Enable JFFS custom scripts and configs**, create
-`/jffs/configs/dnsmasq.conf.add` with the two `address=` lines from the dnsmasq example
-above, then run `service restart_dnsmasq`. Stock ASUS firmware has no custom DNS records; use
-variant A.
-
-#### Variant C: MikroTik (RouterOS 7)
-
-The router must answer DNS for LAN clients (`/ip dns set allow-remote-requests=yes`, block port
-53 from WAN in the firewall) and DHCP must hand out the router IP as DNS server.
-
-```bash
-/ip dns static add name=rtupdate.wunderground.com type=A address=192.168.10.200 comment="vevor-weatherbridge"
+uci add dhcp domain && uci set dhcp.@domain[-1].name='rtupdate.wunderground.com' && uci set dhcp.@domain[-1].ip='192.168.1.200'
 ```
 
 ```bash
-/ip dns static add name=api.weathercloud.net type=A address=192.168.10.200 comment="vevor-weatherbridge"
+uci add dhcp domain && uci set dhcp.@domain[-1].name='api.weathercloud.net' && uci set dhcp.@domain[-1].ip='192.168.1.200'
 ```
 
 ```bash
-/ip dns cache flush
+uci commit dhcp && /etc/init.d/dnsmasq restart
 ```
 
-#### Console with a hard-coded DNS server
+DNS rebind protection does not affect local entries.
 
-If the console ignores DHCP and asks e.g. `8.8.8.8` directly, redirect its DNS traffic (port
-53) to your resolver on the router. These are common community patterns, not vendor-documented
-recipes; adapt interface names and test.
+</details>
 
-MikroTik (only the console, `192.168.10.89`, to the router's own resolver):
+<details>
+<summary>OPNsense / pfSense</summary>
+
+* OPNsense: **Services → Unbound DNS → Overrides → Host overrides → +**: Host `rtupdate`,
+  Domain `wunderground.com`, IP = container IP; then Host `api`, Domain `weathercloud.net`.
+  [Docs](https://docs.opnsense.org/manual/unbound.html)
+* pfSense: **Services → DNS Resolver → General Settings → Host Overrides → Add**, the same two
+  entries, then Apply Changes.
+  [Docs](https://docs.netgate.com/pfsense/en/latest/services/dns/resolver-host-overrides.html)
+
+</details>
+
+<details>
+<summary>UniFi / TP-Link Omada</summary>
+
+* UniFi Network 9.4+: **Settings → Policy Table → Create New Policy → DNS**, type
+  **Host (A)**, one per hostname (9.3: **Settings → Policy Engine → DNS**).
+  [Help article](https://help.ui.com/hc/en-us/articles/15179064940439)
+* Omada (controller 5.15.20+, Omada gateway): **Network Config → Network Settings → LAN →
+  LAN DNS**, type **IP**. [Docs](https://support.omadanetworks.com/us/document/40077/)
+
+</details>
+
+<details>
+<summary>MikroTik (RouterOS 7)</summary>
+
+The router must answer DNS for the LAN (`/ip dns set allow-remote-requests=yes`, with port 53
+blocked from WAN) and hand out its own IP as DNS server via DHCP.
 
 ```bash
-/ip firewall nat add chain=dstnat src-address=192.168.10.89 protocol=udp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
+/ip dns static add name=rtupdate.wunderground.com type=A address=192.168.1.200 comment="vevor-weatherbridge"
 ```
 
 ```bash
-/ip firewall nat add chain=dstnat src-address=192.168.10.89 protocol=tcp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
-```
-
-OpenWrt: see the official guide [DNS hijacking](https://openwrt.org/docs/guide-user/firewall/fw3_configurations/intercept_dns)
-(a `redirect` rule from `lan`, `src_dport 53`, target `DNAT`).
-
-Redirecting port 53 does not help if the console uses DNS-over-HTTPS/TLS or a hard-coded IP
-address instead of a hostname.
-
-### 5. Rollback
-
-Remove (or disable) the DNS entries from step 4 and flush the resolver cache; the console then
-talks to the cloud directly again after its own DNS cache expires (power-cycle it to be sure).
-MikroTik example:
-
-```bash
-/ip dns static disable [find comment="vevor-weatherbridge"]
+/ip dns static add name=api.weathercloud.net type=A address=192.168.1.200 comment="vevor-weatherbridge"
 ```
 
 ```bash
 /ip dns cache flush
 ```
 
-Pi-hole: delete the entries in **Settings → Local DNS Records**; AdGuard Home: delete the DNS
-rewrites; OpenWrt/OPNsense/pfSense/UniFi/Omada: delete the host entries created in step 4.
+</details>
 
-Then stop the stack with `docker compose down`. With MQTT, HA entities become `unavailable`
-through the LWT; delete the device in the MQTT integration to remove them (or publish empty
-retained payloads to `homeassistant/+/weather_station/+/config`). With ESPHome, delete the
-device in the ESPHome integration.
+<details>
+<summary>Routers without custom DNS records (FRITZ!Box, stock ASUS, TP-Link Archer/Deco)</summary>
 
-To reset the forward state to the `.env` defaults, delete `data/state.json` and restart.
+Run Pi-hole or AdGuard Home (see above) and set it as the DNS server in the router's DHCP
+settings.
 
----
+</details>
+
+<details>
+<summary>Console with a hard-coded DNS server</summary>
+
+Redirect the console's DNS traffic (port 53) to your resolver on the router. These are
+common community patterns, not vendor recipes; test them. MikroTik, for a console at
+`192.168.1.89`:
+
+```bash
+/ip firewall nat add chain=dstnat src-address=192.168.1.89 protocol=udp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
+```
+
+```bash
+/ip firewall nat add chain=dstnat src-address=192.168.1.89 protocol=tcp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
+```
+
+OpenWrt: [DNS hijacking guide](https://openwrt.org/docs/guide-user/firewall/fw3_configurations/intercept_dns).
+This does not help against DNS-over-HTTPS/TLS or hard-coded IP addresses.
+
+</details>
+
+## Deployment notes
+
+### Prebuilt image
+
+CI publishes `ghcr.io/piciuok/meteostation-mitm`: `latest` from `main`, `X.Y.Z` and `X.Y` from
+`v*` tags. [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) uses it instead of a local
+build, so image update tools (e.g. What's Up Docker) can track it:
+
+```bash
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+The local build in `docker-compose.yml` is labelled `wud.watch=false`.
+
+### UnRAID
+
+* Use the existing ipvlan/macvlan network (`br0`) with a fixed `CONTAINER_IP`; no port
+  mappings are needed.
+* With the Compose Manager plugin, point the stack at the directory with
+  `docker-compose.yml` and `.env`.
+* The UnRAID host cannot reach containers on an ipvlan network: test from another machine.
+
+## Operations
+
+* **Health:** `GET /healthz` returns enabled backends, MQTT/ESPHome connection state,
+  forwarding state, request and error counters, last upstream status and timestamps. The
+  Docker healthcheck uses it; the container stays healthy while MQTT is down.
+* **Logs:** one INFO line per upload (`WU: 14 fields → HA, forward 200`); upstream failures and
+  fallbacks at WARNING. Unknown requests are logged as `404 …`.
+* **Reset forwarding** to the `.env` defaults: delete `data/state.json` and restart.
+* **Rollback:** remove the DNS entries and flush the DNS cache, power-cycle the console (it
+  uploads to the cloud directly again), run `docker compose down`, then delete the device in
+  Home Assistant (ESPHome or MQTT integration).
+
+## Security
+
+| Area | Measure |
+|---|---|
+| Credentials | Station ID/password (WU) and wid/key (WC) are masked in logs, `data/` files and MQTT; a global log filter also scrubs third-party log records. |
+| Forwarding | Only to `wunderground.com` / `weathercloud.net` (and their subdomains); the `Host` header is normalised, so the proxy cannot reach other hosts. Upstream answers over 64 KiB are discarded. |
+| ESPHome API | Optional Noise encryption (recommended). Hello required first and within 10 s, idle clients dropped after 120 s, at most 8 connections. |
+| MQTT | Use a dedicated broker user, ideally restricted to `meteo_proxy/#` and `homeassistant/#`. Topic settings are validated (no wildcards). |
+| Container | Runs as uid 10001 with only `CAP_NET_BIND_SERVICE`; compose adds `read_only`, `no-new-privileges`, `cap_drop: ALL`. The entrypoint takes over ownership of existing `./data` files. |
+| Secrets | Only in `.env` (git-ignored). |
+
+Report vulnerabilities privately, see [SECURITY.md](SECURITY.md).
+
+## Troubleshooting and known issues
+
+| Symptom | Cause / fix |
+|---|---|
+| Container exits with `Configuration error: …` | Enable a backend or fix the named variable in `.env`. |
+| No `WU: …` log lines | The console does not reach the container: check DNS (`nslookup`), power-cycle the console, check that it uses HTTP. |
+| `404 GET host=… path=…` in the log | The console uses a host or path not handled yet; open an issue with the masked line. |
+| Solar radiation missing at high sun | Known console firmware bug: values above about 367 W/m² arrive as garbage (`-117.-5`) and are rejected ([upstream #9](https://github.com/C9H13NO3-dev/VevorWeatherbridge/issues/9)). |
+| Values like `3.2999999` in history (ESPHome) | ESPHome sends float32; HA rounds only for display. Use MQTT for exact values. |
+| ESPHome device not discovered | mDNS does not cross your network; add it by IP and port 6053. |
+
+Weathercloud uploads are parsed from the `/v01/set/wid/<id>/key/<key>/<name>/<value>` form
+and are not mapped to Home Assistant entities yet.
 
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt && pytest -q
 ```
 
-```bash
-pytest -q
-```
-
-The tests use a local fake upstream HTTP server, a fake MQTT client and the real
-`aioesphomeapi` client. They cover conversions, case-insensitive fields, WC path parsing,
-masking across logs, files and MQTT, forward on/off, upstream down or timeout, MQTT and ESPHome
-switch toggling with persistence, MQTT discovery payloads, and the ESPHome Native API
-(plaintext, Noise, wrong key, entity list, state push, re-list on new fields), and security
-regressions (Host header smuggling, oversized upstream bodies, unsafe MQTT identifiers,
-ESPHome connection hygiene, CI version-string validation). `pytest-timeout` fails a hanging
-test after 30 s.
-
-CI:
+The test suite covers parsing and conversions, forwarding and mocking with a fake upstream,
+credential masking, MQTT discovery, the ESPHome Native API with the real `aioesphomeapi`
+client (plaintext and encrypted), and security regressions.
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | push, PR, `v*` tags | `pytest`, then builds and pushes the image to GHCR (push to `main` / tags) |
-| `esphome-compat.yml` | weekly (Mon 04:17 UTC), manual, changes to the ESPHome code, called by `upstream-watch.yml` | ESPHome tests against `aioesphomeapi` versions: `pinned` (requirements), `ha-stable` (pinned by the latest Home Assistant release), `ha-dev` (HA dev branch), `esphome` (pinned by the latest ESPHome release), `latest` (PyPI). A failed scheduled/upstream-triggered run opens or updates the issue "ESPHome compatibility check failed". |
-| `upstream-watch.yml` | hourly, manual (`force` input) | Polls the latest Home Assistant and ESPHome releases, their `aioesphomeapi` pins, the HA dev pin and the latest `aioesphomeapi`. When anything changed since the last run, it runs `esphome-compat.yml`. The last seen versions are kept as an Actions cache entry, so no extra token or bot commits are needed. |
+| [`ci.yml`](.github/workflows/ci.yml) | push, pull request, `v*` tag | tests; image build and push to GHCR on `main` and tags |
+| [`esphome-compat.yml`](.github/workflows/esphome-compat.yml) | weekly, on ESPHome code changes, on upstream releases | ESPHome tests against the `aioesphomeapi` versions used by this repo, the latest Home Assistant and ESPHome releases, HA dev and PyPI latest |
+| [`upstream-watch.yml`](.github/workflows/upstream-watch.yml) | hourly | detects new Home Assistant / ESPHome / `aioesphomeapi` releases and runs `esphome-compat` |
 
-Check the versions locally with `python scripts/esphome_versions.py snapshot`.
-
-Code layout:
+<details>
+<summary>Code layout</summary>
 
 | Path | Purpose |
 |---|---|
 | `weatherstation.py` | entry point |
-| `weatherbridge/app.py` | aiohttp app, request handling, forward/mock |
-| `weatherbridge/parsing.py` | WU field table + conversions, WC parsing, masking helpers |
-| `weatherbridge/upstream.py` | resolver via `UPSTREAM_DNS`, forwarder, recorded responses |
-| `weatherbridge/mqtt.py` | MQTT backend: HA discovery, state publishing, switch commands, reconnect |
-| `weatherbridge/esphome.py` | ESPHome backend: Native API server (plaintext/Noise), entities, mDNS |
-| `weatherbridge/entities.py` | non-weather entities shared by both backends (switches, diagnostics) |
-| `weatherbridge/config.py` | configuration from environment + validation |
-| `weatherbridge/state.py` | runtime state + `data/state.json` |
-| `weatherbridge/logsafe.py` | global log scrubbing of credentials |
-| `docker-entrypoint.sh` | fixes `/data` ownership, drops root |
-| `scripts/esphome_versions.py` | resolves `aioesphomeapi` versions for the compatibility CI |
+| `weatherbridge/app.py` | HTTP app: routing, forward/mock, diagnostics |
+| `weatherbridge/parsing.py` | WU field table, conversions, WC parsing, masking |
+| `weatherbridge/upstream.py` | upstream resolver, forwarder, recorded responses |
+| `weatherbridge/esphome.py` | ESPHome Native API server (plaintext/Noise), mDNS |
+| `weatherbridge/mqtt.py` | MQTT discovery, state, switch commands |
+| `weatherbridge/entities.py` | entities shared by both backends |
+| `weatherbridge/config.py` | configuration and validation |
+| `weatherbridge/state.py` | runtime state, `data/state.json` |
+| `weatherbridge/logsafe.py` | log scrubbing |
+| `docker-entrypoint.sh` | data ownership, privilege drop |
+| `scripts/esphome_versions.py` | version lookup for the compatibility workflow |
 
----
+</details>
 
-## Known issues / open questions
+## Contributing
 
-* **ESPHome Native API** is implemented by this project on top of `aioesphomeapi`'s protobuf
-  definitions; it is not an official ESPHome device. The weekly `esphome-compat` workflow
-  tests it against the version Home Assistant uses.
-* **Garbage solar radiation from the console** (upstream issue #9). Some consoles send
-  malformed values such as `solarRadiation=-117.-5`. Reportedly, values above about 367 W/m²
-  wrap to negative. One reporter fixed it by having VEVOR replace the console (display unit).
-  The exact encoding is not known, so the bridge does **not** try to reconstruct the value.
-  Unparseable values and negative values of non-negative quantities (radiation, UV, wind,
-  rain, humidity, pressure) are rejected. They are logged at WARNING and listed under
-  `invalid_values` in `last_request_wu.json`. No unit (lux vs W/m²) problem was reported.
-* **Weathercloud format** is implemented from the common `/v01/set/wid/<id>/key/<key>/<name>/<value>`
-  form (a query-string variant is accepted too). Confirm against real traffic in
-  `data/last_request_wc.json`. WC values are not mapped to HA yet.
-* Upload interval: about every 30 s according to upstream issue #8 (YT60233).
-
-## Contributing and repository security
-
-All changes reach `main` through pull requests that the owner reviews and merges
-(`.github/CODEOWNERS`). Dependency updates (GitHub Actions, pip, Docker base image) come
-from Dependabot as pull requests as well; nothing is merged automatically. Security issues:
-see [SECURITY.md](SECURITY.md).
-
-In the repository:
-
-* Third-party GitHub Actions are pinned to commit SHAs (the version is in a comment);
-  Dependabot proposes updates.
-* Workflows run with read-only `GITHUB_TOKEN` by default; only the image job gets
-  `packages: write` and only on pushes to `main` / `v*` tags. Pull requests (also from
-  forks) run tests only, without secrets.
-* Ready-to-import rulesets: [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json)
-  (no deletion or force push of `main`, changes via pull request, CI job `test` must pass;
-  repository admins may bypass) and
-  [`.github/rulesets/protect-release-tags.json`](.github/rulesets/protect-release-tags.json)
-  (only admins create, move or delete `v*` tags, which publish versioned images).
-
-Repository settings to apply in the GitHub UI (owner only):
-
-| Where | Setting |
-|---|---|
-| Settings → Rules → Rulesets → New ruleset → **Import a ruleset** | import both JSON files above |
-| Settings → Actions → General → Fork pull request workflows | **Require approval for all external contributors** |
-| Settings → Actions → General → Workflow permissions | **Read repository contents and packages permissions**; untick *Allow GitHub Actions to create and approve pull requests* |
-| Settings → Advanced Security (Code security) | enable **Private vulnerability reporting**, **Dependabot alerts**, **Dependabot security updates**, **Secret scanning** + **Push protection** |
-| Settings → General → Features | enable **Issues** (the ESPHome compatibility workflow reports failures there); disable **Wiki** / **Projects** if unused |
-| Settings → General → Pull Requests | enable **Automatically delete head branches** |
-| GitHub → Settings → Applications → Installed GitHub Apps | limit third-party apps (e.g. Claude) to the repositories they need; with the `main` ruleset they can only propose pull requests |
-| GHCR package → Package settings | link the package to this repository; only this repository's workflow publishes it |
+Pull requests are welcome; every change is reviewed by the maintainer before it is merged.
+Please run `pytest -q` and keep station credentials out of issues, logs and screenshots.
 
 ## License
 
-[CC0 1.0 Universal](LICENSE).
-
-## Acknowledgements
-
-* Original relay by [C9H13NO3-dev](https://github.com/C9H13NO3-dev/VevorWeatherbridge),
-  inspired by [@vlovmx](https://github.com/vlovmx).
+[CC0 1.0 Universal](LICENSE). Original relay by
+[C9H13NO3-dev](https://github.com/C9H13NO3-dev/VevorWeatherbridge), inspired by
+[@vlovmx](https://github.com/vlovmx).
