@@ -20,6 +20,23 @@ Forked from [C9H13NO3-dev/VevorWeatherbridge](https://github.com/C9H13NO3-dev/Ve
 
 ---
 
+## Screenshots
+
+Real deployment (UnRAID, ipvlan `br0`, both backends enabled for comparison).
+
+| | |
+|---|---|
+| ![ESPHome device in Home Assistant](docs/screenshots/02-ha-esphome-device.png) | ![MQTT device in Home Assistant](docs/screenshots/04-ha-mqtt-device.png) |
+| ESPHome backend: device info (firmware 2.0.0, MAC), sensors, activity with upstream status 200 | MQTT backend: the same data as an MQTT discovery device (model VEVOR YT60234) |
+| ![Forward switches and diagnostics](docs/screenshots/03-ha-esphome-controls-diagnostics.png) | ![/healthz](docs/screenshots/01-healthz.png) |
+| Forward switches (WU, Weathercloud) and diagnostics (last reading, upstream statuses) | `GET /healthz`: MQTT connected, 1 ESPHome client, request counters, upstream 200/200 |
+
+![UnRAID container row](docs/screenshots/05-unraid-container.png)
+
+UnRAID Docker view: Compose stack, `br0`, `192.168.10.200`, `data` volume, healthy.
+
+---
+
 ## Architecture
 
 ```mermaid
