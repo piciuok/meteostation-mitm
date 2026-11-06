@@ -33,8 +33,8 @@ class Config:
     mqtt_password: str | None = None
     discovery_prefix: str = "homeassistant"
     base_topic: str = "meteo_proxy"
-    device_id: str = "stacja_meteo"
-    device_name: str = "Stacja meteo"
+    device_id: str = "weather_station"
+    device_name: str = "Weather Station"
     device_manufacturer: str = "VEVOR"
     device_model: str = "VEVOR YT60234"
     units: str = "metric"
@@ -65,8 +65,8 @@ class Config:
             mqtt_password=e.get("MQTT_PASSWORD") or None,
             discovery_prefix=e.get("DISCOVERY_PREFIX", "homeassistant") or "homeassistant",
             base_topic=e.get("BASE_TOPIC", "meteo_proxy") or "meteo_proxy",
-            device_id=e.get("DEVICE_ID", "stacja_meteo") or "stacja_meteo",
-            device_name=e.get("DEVICE_NAME", "Stacja meteo") or "Stacja meteo",
+            device_id=e.get("DEVICE_ID", "weather_station") or "weather_station",
+            device_name=e.get("DEVICE_NAME", "Weather Station") or "Weather Station",
             device_manufacturer=e.get("DEVICE_MANUFACTURER", "VEVOR") or "VEVOR",
             device_model=e.get("DEVICE_MODEL", "VEVOR YT60234") or "VEVOR YT60234",
             units=units,

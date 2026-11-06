@@ -167,15 +167,15 @@ async def test_mqtt_state_after_request(make_cfg, make_client, upstream):
     await client.get(WU_URL, headers=WU_HOST)
     await drain(app)
     state = json.loads(fake.last("meteo_proxy/state"))
-    assert state["sensors"]["temperatura"] == 10.0
-    assert state["sensors"]["promieniowanie"] == 100.0
+    assert state["sensors"]["temperature"] == 10.0
+    assert state["sensors"]["solar_radiation"] == 100.0
     assert state["upstream"]["wu"] == 200 and state["forward_wu"] is True
     assert state["diag"]["requests_wu"] == 1
     assert state["diag"]["wu_unmapped"] == ["soilmoisture", "windspdmph_avg2m"]
     topics = [t for t, _, _ in fake.messages]
-    assert "homeassistant/sensor/stacja_meteo/temperatura/config" in topics
+    assert "homeassistant/sensor/weather_station/temperature/config" in topics
     # discovery is published before the state
-    assert topics.index("homeassistant/sensor/stacja_meteo/temperatura/config") < topics.index("meteo_proxy/state")
+    assert topics.index("homeassistant/sensor/weather_station/temperature/config") < topics.index("meteo_proxy/state")
     # second request does not re-announce
     fake.messages.clear()
     await client.get(WU_URL, headers=WU_HOST)
@@ -185,7 +185,7 @@ async def test_mqtt_state_after_request(make_cfg, make_client, upstream):
     await client.get("/weatherstation/updateweatherstation.php?tempf=68", headers=WU_HOST)
     await drain(app)
     state = json.loads(fake.last("meteo_proxy/state"))
-    assert state["sensors"]["temperatura"] == 20.0 and state["sensors"]["wilgotnosc"] == 57
+    assert state["sensors"]["temperature"] == 20.0 and state["sensors"]["humidity"] == 57
 
 
 async def test_toggle_forward_via_mqtt_and_restart(make_cfg, upstream):
@@ -213,14 +213,14 @@ async def test_ha_online_reannounces(make_cfg):
     cfg = make_cfg()
     cfg.data_dir.mkdir(parents=True)
     state = ProxyState(cfg.data_dir, {"wu": True, "wc": True})
-    state.sensors = {"temperatura": 1.0}
+    state.sensors = {"temperature": 1.0}
     bridge = HABridge(cfg, state)
     fake = FakeMQTT()
     bridge.client = fake
     await bridge.handle_message("homeassistant/status", b"online")
     topics = [t for t, _, _ in fake.messages]
-    assert "homeassistant/sensor/stacja_meteo/temperatura/config" in topics
-    assert "homeassistant/switch/stacja_meteo/przekazuj_do_wu/config" in topics
+    assert "homeassistant/sensor/weather_station/temperature/config" in topics
+    assert "homeassistant/switch/weather_station/forward_to_wu/config" in topics
     assert topics[-1] == "meteo_proxy/state"
     assert all(retain for _, _, retain in fake.messages)
     fake.messages.clear()

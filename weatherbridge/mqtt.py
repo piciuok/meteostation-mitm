@@ -16,8 +16,8 @@ log = logging.getLogger(__name__)
 
 SWITCHES = {
     # svc: (object id suffix, entity name)
-    "wu": ("przekazuj_do_wu", "Przekazuj do WU"),
-    "wc": ("przekazuj_do_weathercloud", "Przekazuj do Weathercloud"),
+    "wu": ("forward_to_wu", "Forward to WU"),
+    "wc": ("forward_to_weathercloud", "Forward to Weathercloud"),
 }
 STATUS_SENSORS = {
     "wu": ("upstream_wu_status", "Upstream WU status"),
@@ -92,7 +92,7 @@ class HABridge:
 
     def static_discovery(self) -> list[tuple[str, dict[str, Any]]]:
         out = []
-        p = self._common("sensor", "ostatni_odczyt", "Ostatni odczyt")
+        p = self._common("sensor", "last_reading", "Last reading")
         p.update({
             "device_class": "timestamp",
             "entity_category": "diagnostic",
@@ -100,7 +100,7 @@ class HABridge:
             "json_attributes_topic": self.state_topic,
             "json_attributes_template": "{{ value_json.diag | tojson }}",
         })
-        out.append((self._topic("sensor", "ostatni_odczyt"), p))
+        out.append((self._topic("sensor", "last_reading"), p))
         for svc, (oid, name) in STATUS_SENSORS.items():
             p = self._common("sensor", oid, name)
             p.update({

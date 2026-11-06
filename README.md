@@ -68,45 +68,45 @@ the console's response.
 
 ## Home Assistant entities
 
-One device: `identifiers: [stacja_meteo]`, name `Stacja meteo`, model `VEVOR YT60234`
-(configurable). Entity IDs below assume `DEVICE_ID=stacja_meteo`.
+One device: `identifiers: [weather_station]`, name `Weather Station`, model `VEVOR YT60234`
+(configurable). Entity IDs below assume `DEVICE_ID=weather_station`.
 
 | Entity | WU field | Unit | device_class | state_class |
 |---|---|---|---|---|
-| `sensor.stacja_meteo_temperatura` | tempf | °C | temperature | measurement |
-| `sensor.stacja_meteo_wilgotnosc` | humidity | % | humidity | measurement |
-| `sensor.stacja_meteo_punkt_rosy` | dewptf | °C | temperature | measurement |
-| `sensor.stacja_meteo_temperatura_odczuwalna` | windchillf | °C | temperature | measurement |
-| `sensor.stacja_meteo_temperatura_konsola` | indoortempf | °C | temperature | measurement |
-| `sensor.stacja_meteo_wilgotnosc_konsola` | indoorhumidity | % | humidity | measurement |
-| `sensor.stacja_meteo_wiatr_predkosc` | windspeedmph | km/h | wind_speed | measurement |
-| `sensor.stacja_meteo_wiatr_porywy` | windgustmph | km/h | wind_speed | measurement |
-| `sensor.stacja_meteo_wiatr_kierunek` | winddir | ° | – (mdi:compass) | – |
-| `sensor.stacja_meteo_opad_intensywnosc` | rainin | mm/h | precipitation_intensity | measurement |
-| `sensor.stacja_meteo_opad_dzienny` | dailyrainin | mm | precipitation | total_increasing |
-| `sensor.stacja_meteo_opad_tygodniowy` | weeklyrainin | mm | precipitation | total_increasing |
-| `sensor.stacja_meteo_opad_miesieczny` | monthlyrainin | mm | precipitation | total_increasing |
-| `sensor.stacja_meteo_opad_roczny` | yearlyrainin | mm | precipitation | total_increasing |
-| `sensor.stacja_meteo_promieniowanie` | solarradiation | W/m² | irradiance | measurement |
-| `sensor.stacja_meteo_uv` | UV | – | – | measurement |
-| `sensor.stacja_meteo_cisnienie_wzgledne` | baromin | hPa | atmospheric_pressure | measurement |
-| `sensor.stacja_meteo_cisnienie_absolutne` | absbaromin | hPa | atmospheric_pressure | measurement |
-| `sensor.stacja_meteo_ostatni_odczyt` | – | timestamp, diagnostic | | |
-| `sensor.stacja_meteo_upstream_wu_status` | – | last HTTP code or `error`, diagnostic | | |
-| `sensor.stacja_meteo_upstream_wc_status` | – | last HTTP code or `error`, diagnostic | | |
-| `switch.stacja_meteo_przekazuj_do_wu` | – | forward to WU, config | | |
-| `switch.stacja_meteo_przekazuj_do_weathercloud` | – | forward to Weathercloud, config | | |
+| `sensor.weather_station_temperature` | tempf | °C | temperature | measurement |
+| `sensor.weather_station_humidity` | humidity | % | humidity | measurement |
+| `sensor.weather_station_dew_point` | dewptf | °C | temperature | measurement |
+| `sensor.weather_station_wind_chill` | windchillf | °C | temperature | measurement |
+| `sensor.weather_station_indoor_temperature` | indoortempf | °C | temperature | measurement |
+| `sensor.weather_station_indoor_humidity` | indoorhumidity | % | humidity | measurement |
+| `sensor.weather_station_wind_speed` | windspeedmph | km/h | wind_speed | measurement |
+| `sensor.weather_station_wind_gust` | windgustmph | km/h | wind_speed | measurement |
+| `sensor.weather_station_wind_direction` | winddir | ° | – (mdi:compass) | – |
+| `sensor.weather_station_rain_rate` | rainin | mm/h | precipitation_intensity | measurement |
+| `sensor.weather_station_daily_rain` | dailyrainin | mm | precipitation | total_increasing |
+| `sensor.weather_station_weekly_rain` | weeklyrainin | mm | precipitation | total_increasing |
+| `sensor.weather_station_monthly_rain` | monthlyrainin | mm | precipitation | total_increasing |
+| `sensor.weather_station_yearly_rain` | yearlyrainin | mm | precipitation | total_increasing |
+| `sensor.weather_station_solar_radiation` | solarradiation | W/m² | irradiance | measurement |
+| `sensor.weather_station_uv_index` | UV | – | – | measurement |
+| `sensor.weather_station_relative_pressure` | baromin | hPa | atmospheric_pressure | measurement |
+| `sensor.weather_station_absolute_pressure` | absbaromin | hPa | atmospheric_pressure | measurement |
+| `sensor.weather_station_last_reading` | – | timestamp, diagnostic | | |
+| `sensor.weather_station_upstream_wu_status` | – | last HTTP code or `error`, diagnostic | | |
+| `sensor.weather_station_upstream_wc_status` | – | last HTTP code or `error`, diagnostic | | |
+| `switch.weather_station_forward_to_wu` | – | forward to WU, config | | |
+| `switch.weather_station_forward_to_weathercloud` | – | forward to Weathercloud, config | | |
 
 * Weather sensors are announced the first time their field arrives.
 * Conversions: °C = (°F − 32)·5/9, km/h = mph·1.609344, mm = in·25.4, hPa = inHg·33.8639.
   Values are rounded to 0.1, humidity and wind direction to integers.
 * WU field names are matched **case-insensitively** (the YT60234 sends `solarRadiation`).
 * Values `-9999`, empty and `NaN` are skipped (not published).
-* `ostatni_odczyt` attributes: request counters, upstream error counters, `last_seen_*`,
+* `last_reading` attributes: request counters, upstream error counters, `last_seen_*`,
   forward state, `wu_fields` (names received) and `wu_unmapped` (unknown names, no values).
 * No `weather.*` entity and no forecast are created; that is a separate step in HA.
 * Entity IDs come from `default_entity_id` in the discovery payload (HA 2025.10+). The entity
-  names also slugify to the same IDs (`Wilgotność` → `wilgotnosc`), so the result is the same
+  names also slugify to the same IDs (`Humidity` → `humidity`), so the result is the same
   on older versions.
 
 ### MQTT topics
@@ -117,7 +117,7 @@ One device: `identifiers: [stacja_meteo]`, name `Stacja meteo`, model `VEVOR YT6
 | `meteo_proxy/status` | `online` / `offline` (LWT, retained) |
 | `meteo_proxy/forward/wu/set`, `meteo_proxy/forward/wc/set` | switch commands `ON` / `OFF` |
 | `homeassistant/status` | subscribed; on `online` discovery and state are re-published |
-| `homeassistant/<sensor\|switch>/stacja_meteo/<key>/config` | discovery (retained) |
+| `homeassistant/<sensor\|switch>/weather_station/<key>/config` | discovery (retained) |
 
 The last values are accumulated and persisted in `data/state.json`. A request that lacks some
 field does not break the templates of entities announced earlier, and values survive a restart.
@@ -139,7 +139,7 @@ every variable). `docker-compose.yml` only wires the environment together and co
 | `UPSTREAM_DNS` | `1.1.1.1,9.9.9.9` | resolvers for upstream hosts |
 | `UPSTREAM_TIMEOUT` | `8` | upstream timeout in seconds |
 | `WU_USERNAME` / `WU_PASSWORD` | – | optionally override the station ID/key sent to WU |
-| `DEVICE_ID` / `DEVICE_NAME` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `stacja_meteo` / `Stacja meteo` / `VEVOR YT60234` / `VEVOR` | HA device |
+| `DEVICE_ID` / `DEVICE_NAME` / `DEVICE_MODEL` / `DEVICE_MANUFACTURER` | `weather_station` / `Weather Station` / `VEVOR YT60234` / `VEVOR` | HA device |
 | `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
 | `BASE_TOPIC` | `meteo_proxy` | state / status / command topics |
 | `UNITS` | `metric` | `imperial` publishes the raw WU units (°F, mph, in, inHg) |
@@ -222,7 +222,7 @@ curl -s -H 'Host: rtupdate.wunderground.com' 'http://192.168.10.200/weatherstati
 ```
 
 Expected: `success` (or the recorded WU response). Then check `data/last_request_wu.json`
-(ID/PASSWORD shown as `***`) and the `Stacja meteo` device in HA.
+(ID/PASSWORD shown as `***`) and the `Weather Station` device in HA.
 
 ### 4. Router DNS (MikroTik)
 
@@ -258,7 +258,7 @@ Disable the DNS overrides. The console then talks to the cloud directly again:
 
 Then stop the stack with `docker compose down`. HA entities become `unavailable` through the LWT.
 To remove them from HA, delete the device in the MQTT integration. Alternatively, publish
-empty retained payloads to the `homeassistant/+/stacja_meteo/+/config` topics.
+empty retained payloads to the `homeassistant/+/weather_station/+/config` topics.
 
 To reset the forward state to the `.env` defaults, delete `data/state.json` and restart.
 
