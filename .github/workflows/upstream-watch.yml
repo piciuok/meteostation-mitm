@@ -1,0 +1,95 @@
+name: Upstream release watch
+
+# GitHub cannot subscribe to releases of other repositories, so this polls hourly:
+# latest Home Assistant release (+ its aioesphomeapi pin), HA dev pin, latest ESPHome
+# release (+ its pin) and latest aioesphomeapi. When the snapshot differs from the last
+# one seen, the ESPHome compatibility tests run. The last snapshot is remembered as an
+# Actions cache entry keyed by its hash (no extra token or commits needed).
+
+on:
+  schedule:
+    - cron: "41 * * * *"   # hourly
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run the compatibility tests even if nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.decide.outputs.changed }}
+      key: ${{ steps.snap.outputs.key }}
+      snapshot: ${{ steps.snap.outputs.snapshot }}
+      reason: ${{ steps.snap.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Snapshot upstream versions
+        id: snap
+        run: |
+          python scripts/esphome_versions.py snapshot > upstream.json
+          snap=$(cat upstream.json)
+          echo "snapshot=$snap" >> "$GITHUB_OUTPUT"
+          echo "key=upstream-versions-$(sha256sum upstream.json | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          reason=$(python -c "import json,sys; d=json.load(open('upstream.json')); print(f\"HA {d['home_assistant']} (aioesphomeapi {d['ha_stable_pin']}), HA dev pin {d['ha_dev_pin']}, ESPHome {d['esphome']} (aioesphomeapi {d['esphome_pin']}), aioesphomeapi latest {d['aioesphomeapi_latest']}\")")
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream versions"
+            echo
+            echo '```json'
+            python -m json.tool upstream.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Look up last seen snapshot
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: upstream.json
+          key: ${{ steps.snap.outputs.key }}
+          lookup-only: true
+      - name: Decide
+        id: decide
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "**New upstream versions detected → running ESPHome compatibility tests.**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream change since the last run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  compat:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    uses: ./.github/workflows/esphome-compat.yml
+    with:
+      reason: ${{ needs.detect.outputs.reason }}
+      report: true
+    permissions:
+      contents: read
+      issues: write
+
+  remember:
+    needs: [detect, compat]
+    # Remember the snapshot after the tests ran (pass or fail), so a failure is reported
+    # once per upstream change instead of every hour.
+    if: always() && needs.detect.outputs.changed == 'true' && (needs.compat.result == 'success' || needs.compat.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write snapshot
+        env:
+          SNAPSHOT: ${{ needs.detect.outputs.snapshot }}
+        run: printf '%s\n' "$SNAPSHOT" > upstream.json
+      - name: Save snapshot
+        uses: actions/cache/save@v4
+        with:
+          path: upstream.json
+          key: ${{ needs.detect.outputs.key }}

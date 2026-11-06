@@ -4,13 +4,26 @@ name: ESPHome compatibility
 #   pinned    - our requirements.txt
 #   ha-stable - what the latest Home Assistant release uses to talk to this container
 #   ha-dev    - what the next Home Assistant release will use
+#   esphome   - what the latest ESPHome release (dashboard/CLI) uses
 #   latest    - newest aioesphomeapi on PyPI (early warning, server code built against it)
 # The tests start our ESPHome server and connect with the real aioesphomeapi client.
+# Triggered weekly, manually, on changes to the ESPHome code, and by upstream-watch.yml
+# whenever a new Home Assistant / ESPHome / aioesphomeapi release is detected.
 
 on:
   schedule:
-    - cron: "17 4 * * 1"   # Mondays 04:17 UTC
+    - cron: "17 4 * * 1"   # Mondays 04:17 UTC (safety net)
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      reason:
+        description: Why the run was triggered (shown in the summary and in the issue)
+        type: string
+        default: ""
+      report:
+        description: Open/update an issue when the run fails
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -29,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pinned, ha-stable, ha-dev, latest]
+        target: [pinned, ha-stable, ha-dev, esphome, latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +54,7 @@ jobs:
           v=$(python scripts/esphome_versions.py ${{ matrix.target }})
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "### ${{ matrix.target }}: aioesphomeapi $v" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ inputs.reason }}" ]; then echo "Trigger: ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"; fi
       - name: Install
         run: |
           pip install -r requirements-dev.txt
@@ -53,7 +67,7 @@ jobs:
 
   report:
     needs: compat
-    if: failure() && github.event_name == 'schedule'
+    if: failure() && (github.event_name == 'schedule' || inputs.report)
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -62,10 +76,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REASON: ${{ inputs.reason }}
         run: |
           title="ESPHome compatibility check failed"
           num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number -q '.[0].number')
-          body="The scheduled ESPHome compatibility run failed: $RUN_URL"
+          body="The ESPHome compatibility run failed: $RUN_URL"
+          if [ -n "$REASON" ]; then body="$body"$'\n\n'"Trigger: $REASON"; fi
           if [ -n "$num" ]; then
             gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "$body"
           else

@@ -475,9 +475,10 @@ CI:
 | Workflow | When | What |
 |---|---|---|
 | `ci.yml` | push, PR, `v*` tags | `pytest`, then builds and pushes the image to GHCR (push to `main` / tags) |
-| `esphome-compat.yml` | weekly (Mon 04:17 UTC), manual, changes to the ESPHome code | ESPHome tests against `aioesphomeapi` versions: `pinned` (requirements), `ha-stable` (pinned by the latest Home Assistant release), `ha-dev` (HA dev branch), `latest` (PyPI). A failed scheduled run opens or updates the issue "ESPHome compatibility check failed". |
+| `esphome-compat.yml` | weekly (Mon 04:17 UTC), manual, changes to the ESPHome code, called by `upstream-watch.yml` | ESPHome tests against `aioesphomeapi` versions: `pinned` (requirements), `ha-stable` (pinned by the latest Home Assistant release), `ha-dev` (HA dev branch), `esphome` (pinned by the latest ESPHome release), `latest` (PyPI). A failed scheduled/upstream-triggered run opens or updates the issue "ESPHome compatibility check failed". |
+| `upstream-watch.yml` | hourly, manual (`force` input) | Polls the latest Home Assistant and ESPHome releases, their `aioesphomeapi` pins, the HA dev pin and the latest `aioesphomeapi`. When anything changed since the last run, it runs `esphome-compat.yml`. The last seen versions are kept as an Actions cache entry, so no extra token or bot commits are needed. |
 
-Check the versions locally with `python scripts/esphome_versions.py ha-stable`.
+Check the versions locally with `python scripts/esphome_versions.py snapshot`.
 
 Code layout:
 
