@@ -1,0 +1,20 @@
+# Prebuilt image from GitHub Container Registry (WUD can track it).
+#   docker compose -f docker-compose.ghcr.yml pull && docker compose -f docker-compose.ghcr.yml up -d
+name: vevor-weatherbridge
+
+services:
+  vevor-weatherbridge:
+    image: ghcr.io/piciuok/meteostation-mitm:latest
+    container_name: vevor-weatherbridge
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    networks:
+      lan:
+        ipv4_address: ${CONTAINER_IP:-192.168.10.200}
+
+networks:
+  lan:
+    name: ${DOCKER_NETWORK:-br0}
+    external: true

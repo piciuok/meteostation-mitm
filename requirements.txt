@@ -1,5 +1,4 @@
-Flask
-pytz
-paho-mqtt
-requests
-dnspython
+aiohttp==3.14.5
+aiomqtt==2.5.1
+paho-mqtt==2.2.0
+dnspython==2.9.2

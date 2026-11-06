@@ -1,24 +1,24 @@
+# Local build. Configuration lives in .env (copy from .env.example), data in ./data.
+# For the prebuilt GHCR image use docker-compose.ghcr.yml instead.
+name: vevor-weatherbridge
+
 services:
-  weatherstation:
+  vevor-weatherbridge:
     build: .
-    container_name: weatherstation
-    ports:
-      - "80:80"
+    image: vevor-weatherbridge:local
+    container_name: vevor-weatherbridge
     restart: unless-stopped
-    environment:
-      TZ: Europe/Berlin
-      MQTT_HOST: mqtt             # <-- SET YOUR MQTT BROKER HOST
-      MQTT_PORT: 1883             # <-- Optional broker port
-      MQTT_USER: user             # <-- Optional username
-      MQTT_PASSWORD: pass         # <-- Optional password
-      DEVICE_ID: weather_station  # <-- Device identifier
-      DEVICE_NAME: "Backyard Weather"  # <-- Display name
-      DEVICE_MANUFACTURER: VEVOR  # <-- Optional manufacturer
-      DEVICE_MODEL: "7-in-1 Weather Station"  # <-- Optional model name
-      # UNITS can be "metric" or "imperial". Default is metric
-      UNITS: metric
-      # forward data to Weather Underground
-      WU_FORWARD: "false"
-      # credentials for Weather Underground (optional)
-      WU_USERNAME: wu-user
-      WU_PASSWORD: wu-pass
+    env_file: .env
+    volumes:
+      - ./data:/data
+    labels:
+      wud.watch: "false"   # locally built image, nothing to watch in a registry
+    networks:
+      lan:
+        ipv4_address: ${CONTAINER_IP:-192.168.10.200}
+
+networks:
+  lan:
+    # Existing ipvlan/macvlan network created by UnRAID (Settings → Docker), e.g. br0.
+    name: ${DOCKER_NETWORK:-br0}
+    external: true
