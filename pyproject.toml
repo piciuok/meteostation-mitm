@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vevor-weatherbridge"
+dynamic = ["version", "dependencies"]
+description = "Local Weather Underground / Weathercloud proxy for VEVOR weather stations with Home Assistant integration (ESPHome Native API and MQTT discovery)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "CC0-1.0"
+keywords = [
+    "vevor", "yt60234", "weather-station", "personal-weather-station", "pws",
+    "weather-underground", "wunderground", "weathercloud", "home-assistant",
+    "esphome", "esphome-native-api", "mqtt", "mqtt-discovery", "dns-redirect",
+    "proxy", "local-control", "docker", "unraid",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Framework :: AsyncIO",
+    "Framework :: aiohttp",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+[project.urls]
+Homepage = "https://github.com/piciuok/meteostation-mitm"
+Source = "https://github.com/piciuok/meteostation-mitm"
+Issues = "https://github.com/piciuok/meteostation-mitm/issues"
+Container = "https://github.com/piciuok/meteostation-mitm/pkgs/container/meteostation-mitm"
+Upstream = "https://github.com/C9H13NO3-dev/VevorWeatherbridge"
+
+[project.scripts]
+vevor-weatherbridge = "weatherbridge.app:main"
+
+[tool.setuptools]
+packages = ["weatherbridge"]
+
+[tool.setuptools.dynamic]
+version = { attr = "weatherbridge.__version__" }
+dependencies = { file = ["requirements.txt"] }
