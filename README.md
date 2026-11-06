@@ -231,10 +231,121 @@ curl -s -H 'Host: rtupdate.wunderground.com' 'http://192.168.10.200/weatherstati
 Expected: `success` (or the recorded WU response). Then check `data/last_request_wu.json`
 (ID/PASSWORD shown as `***`) and the `Weather Station` device in HA.
 
-### 4. Router DNS (MikroTik)
+### 4. Redirect the console to the container (DNS)
 
-Point both hostnames at the container. The console must use the router as its DNS server
-(DHCP default).
+The console resolves `rtupdate.wunderground.com` (and `api.weathercloud.net` if Weathercloud is
+enabled on it) through the DNS server it got via DHCP. Make that DNS server answer both names
+with the container IP. Pick **one** of the variants below. Examples use `192.168.10.200`.
+
+Check before you start:
+
+* The console must use the DNS server you change (normally the router, handed out by DHCP).
+  If it has a hard-coded DNS server, see [Console with a hard-coded DNS server](#console-with-a-hard-coded-dns-server).
+* The upload must be plain HTTP (port 80). Check the router's connection table or a packet
+  capture. If WU goes over 443/HTTPS, it cannot be intercepted this way.
+* Hosts-style entries (Pi-hole, OpenWrt Hostnames, OPNsense/pfSense overrides, MikroTik static)
+  match the **exact** name only. Add every hostname the console really uses (check the DNS log
+  or cache of your resolver).
+
+Verify from any LAN machine that uses the same DNS server:
+
+```bash
+nslookup rtupdate.wunderground.com
+```
+
+Expected answer: `192.168.10.200`. Then power-cycle the console (it caches DNS) and watch
+`docker logs -f vevor-weatherbridge` for `WU: … fields → HA` lines.
+
+#### Variant A: local DNS server (Pi-hole, AdGuard Home)
+
+Use this when your router cannot create custom DNS records (e.g. AVM FRITZ!Box, stock ASUS
+firmware, consumer TP-Link Archer/Deco). Hand out the Pi-hole/AdGuard IP as DNS server in the
+router's DHCP settings.
+
+**Pi-hole v6** ([docs](https://docs.pi-hole.net/ftldns/configfile/#hosts)):
+UI **Settings → Local DNS Records**, add both names with `192.168.10.200`. CLI equivalent
+(replaces the whole `dns.hosts` list, so include your existing entries):
+
+```bash
+sudo pihole-FTL --config dns.hosts '[ "192.168.10.200 rtupdate.wunderground.com api.weathercloud.net" ]'
+```
+
+In the Pi-hole Docker image the same key is set with the `FTLCONF_dns_hosts` environment variable.
+
+**AdGuard Home** ([docs](https://adguard-dns.io/kb/adguard-home/faq/)):
+UI **Filters → DNS rewrites → Add DNS rewrite**: domain `rtupdate.wunderground.com`, answer
+`192.168.10.200`; the same for `api.weathercloud.net`. YAML equivalent in `AdGuardHome.yaml`
+(edit only while AdGuard Home is stopped, otherwise it overwrites the file):
+
+```yaml
+filtering:
+  rewrites:
+    - domain: rtupdate.wunderground.com
+      answer: 192.168.10.200
+      enabled: true
+    - domain: api.weathercloud.net
+      answer: 192.168.10.200
+      enabled: true
+```
+
+**Plain dnsmasq** ([man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html)), then restart dnsmasq:
+
+```
+address=/rtupdate.wunderground.com/192.168.10.200
+address=/api.weathercloud.net/192.168.10.200
+```
+
+`address=` also matches subdomains. Since dnsmasq 2.86 queries of another type (AAAA) for these
+names are forwarded upstream; add `local=/rtupdate.wunderground.com/` (and the same for
+Weathercloud) if the console uses IPv6.
+
+#### Variant B: router with local DNS records
+
+**OpenWrt** (LuCI, OpenWrt 25.12: **Network → DNS → DNS Records → Hostnames**; 24.10:
+**Network → DHCP and DNS**). CLI:
+
+```bash
+uci add dhcp domain
+uci set dhcp.@domain[-1].name='rtupdate.wunderground.com'
+uci set dhcp.@domain[-1].ip='192.168.10.200'
+uci add dhcp domain
+uci set dhcp.@domain[-1].name='api.weathercloud.net'
+uci set dhcp.@domain[-1].ip='192.168.10.200'
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+```
+
+DNS rebind protection (on by default) only filters private IPs in *upstream* answers, local
+entries are not affected.
+
+**OPNsense** ([docs](https://docs.opnsense.org/manual/unbound.html)):
+**Services → Unbound DNS → Overrides → Host overrides → +**: Host `rtupdate`, Domain
+`wunderground.com`, Type A, IP `192.168.10.200`; then Host `api`, Domain `weathercloud.net`. Apply.
+
+**pfSense** ([docs](https://docs.netgate.com/pfsense/en/latest/services/dns/resolver-host-overrides.html)):
+**Services → DNS Resolver → General Settings → Host Overrides → Add**: Host `rtupdate`,
+Domain `wunderground.com`, IP `192.168.10.200`; the same for `api` / `weathercloud.net`.
+Save, Apply Changes. Only clients using the firewall as DNS are affected.
+
+**UniFi Network** ([help article](https://help.ui.com/hc/en-us/articles/15179064940439)):
+Network 9.4+: **Settings → Policy Table → Create New Policy → DNS**, type **Host (A)**, domain
+`rtupdate.wunderground.com`, IP `192.168.10.200` (Network 9.3: **Settings → Policy Engine → DNS**).
+Repeat for `api.weathercloud.net`. Clients must use the gateway as DNS.
+
+**TP-Link Omada** ([docs](https://support.omadanetworks.com/us/document/40077/), controller
+5.15.20+ with an Omada gateway): **Network Config → Network Settings → LAN → LAN DNS**, type
+**IP**, both names → `192.168.10.200`.
+
+**ASUS with Asuswrt-Merlin** ([wiki](https://github.com/RMerl/asuswrt-merlin.ng/wiki/Custom-domains-with-dnsmasq)):
+enable **Administration → System → Enable JFFS custom scripts and configs**, create
+`/jffs/configs/dnsmasq.conf.add` with the two `address=` lines from the dnsmasq example
+above, then run `service restart_dnsmasq`. Stock ASUS firmware has no custom DNS records; use
+variant A.
+
+#### Variant C: MikroTik (RouterOS 7)
+
+The router must answer DNS for LAN clients (`/ip dns set allow-remote-requests=yes`, block port
+53 from WAN in the firewall) and DHCP must hand out the router IP as DNS server.
 
 ```bash
 /ip dns static add name=rtupdate.wunderground.com type=A address=192.168.10.200 comment="vevor-weatherbridge"
@@ -248,12 +359,33 @@ Point both hostnames at the container. The console must use the router as its DN
 /ip dns cache flush
 ```
 
-Power-cycle the console (or wait for its DNS cache to expire), then watch
-`docker logs -f vevor-weatherbridge` for `WU: … fields → HA` lines.
+#### Console with a hard-coded DNS server
+
+If the console ignores DHCP and asks e.g. `8.8.8.8` directly, redirect its DNS traffic (port
+53) to your resolver on the router. These are common community patterns, not vendor-documented
+recipes; adapt interface names and test.
+
+MikroTik (only the console, `192.168.10.89`, to the router's own resolver):
+
+```bash
+/ip firewall nat add chain=dstnat src-address=192.168.10.89 protocol=udp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
+```
+
+```bash
+/ip firewall nat add chain=dstnat src-address=192.168.10.89 protocol=tcp dst-port=53 action=redirect to-ports=53 comment="vevor-weatherbridge"
+```
+
+OpenWrt: see the official guide [DNS hijacking](https://openwrt.org/docs/guide-user/firewall/fw3_configurations/intercept_dns)
+(a `redirect` rule from `lan`, `src_dport 53`, target `DNAT`).
+
+Redirecting port 53 does not help if the console uses DNS-over-HTTPS/TLS or a hard-coded IP
+address instead of a hostname.
 
 ### 5. Rollback
 
-Disable the DNS overrides. The console then talks to the cloud directly again:
+Remove (or disable) the DNS entries from step 4 and flush the resolver cache; the console then
+talks to the cloud directly again after its own DNS cache expires (power-cycle it to be sure).
+MikroTik example:
 
 ```bash
 /ip dns static disable [find comment="vevor-weatherbridge"]
@@ -263,9 +395,13 @@ Disable the DNS overrides. The console then talks to the cloud directly again:
 /ip dns cache flush
 ```
 
-Then stop the stack with `docker compose down`. HA entities become `unavailable` through the LWT.
-To remove them from HA, delete the device in the MQTT integration. Alternatively, publish
-empty retained payloads to the `homeassistant/+/weather_station/+/config` topics.
+Pi-hole: delete the entries in **Settings → Local DNS Records**; AdGuard Home: delete the DNS
+rewrites; OpenWrt/OPNsense/pfSense/UniFi/Omada: delete the host entries created in step 4.
+
+Then stop the stack with `docker compose down`. With MQTT, HA entities become `unavailable`
+through the LWT; delete the device in the MQTT integration to remove them (or publish empty
+retained payloads to `homeassistant/+/weather_station/+/config`). With ESPHome, delete the
+device in the ESPHome integration.
 
 To reset the forward state to the `.env` defaults, delete `data/state.json` and restart.
 
