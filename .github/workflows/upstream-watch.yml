@@ -57,8 +57,11 @@ jobs:
           lookup-only: true
       - name: Decide
         id: decide
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
         run: |
-          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+          if [ "$CACHE_HIT" != "true" ] || [ "$FORCE" = "true" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "**New upstream versions detected → running ESPHome compatibility tests.**" >> "$GITHUB_STEP_SUMMARY"
           else

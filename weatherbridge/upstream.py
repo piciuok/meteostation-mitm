@@ -27,6 +27,9 @@ DEFAULT_RESPONSES = {
     "wc": {"status": 200, "content_type": "text/plain", "body": "200"},
 }
 
+# Upstream answers are a few bytes ("success", "200"); anything larger is not passed on.
+MAX_UPSTREAM_BODY = 64 * 1024
+
 # Headers copied from the console request to the upstream request.
 _FORWARD_HEADERS = ("User-Agent", "Accept", "Content-Type")
 
@@ -115,7 +118,12 @@ class Forwarder:
         try:
             async with session.request(method, URL(target, encoded=True), headers=out_headers,
                                        data=body or None, allow_redirects=False) as resp:
-                data = await resp.read()
+                buf = bytearray()
+                async for chunk in resp.content.iter_any():
+                    buf += chunk
+                    if len(buf) > MAX_UPSTREAM_BODY:
+                        raise UpstreamError(f"response larger than {MAX_UPSTREAM_BODY} bytes")
+                data = bytes(buf)
                 ctype = resp.headers.get("Content-Type", "text/plain")
                 return UpstreamResponse(resp.status, ctype, data)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, dns.exception.DNSException) as exc:

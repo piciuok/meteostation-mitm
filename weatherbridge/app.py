@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from aiohttp import web
@@ -35,15 +36,34 @@ STORE = web.AppKey("store", ResponseStore)
 TASKS = web.AppKey("tasks", set)
 
 
+_HOSTNAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
+
+
+def clean_host(host: str) -> str:
+    """Normalise a Host header to a bare DNS name; anything else (paths, userinfo, IPs
+    with odd characters, ...) becomes an empty string."""
+    host = host.strip().lower()
+    name, sep, port = host.rpartition(":")
+    if sep and port.isdigit():
+        host = name
+    host = host.rstrip(".")
+    return host if _HOSTNAME.fullmatch(host) else ""
+
+
+def is_service_host(svc: str, host: str) -> bool:
+    """True if `host` is one of the service's domains or a subdomain of them."""
+    return any(host == d or host.endswith("." + d) for d in HOST_SUFFIXES[svc])
+
+
 def classify(host: str, path: str) -> str | None:
     """Recognise the service by request path (primary) or Host header."""
-    host = host.split(":")[0].lower()
+    host = clean_host(host)
     if path.startswith("/weatherstation/"):
         return "wu"
     if path.startswith("/v01/") or path.startswith("/v1/"):
         return "wc"
-    for svc, suffixes in HOST_SUFFIXES.items():
-        if host.endswith(suffixes) and path not in ("", "/"):
+    for svc in HOST_SUFFIXES:
+        if is_service_host(svc, host) and path not in ("", "/"):
             # Known host but unexpected path: still recognised, forwarded transparently.
             return svc
     return None
@@ -51,10 +71,8 @@ def classify(host: str, path: str) -> str | None:
 
 def upstream_host(svc: str, host: str) -> str:
     """Only ever forward to the service's own domain (never an arbitrary Host header)."""
-    host = host.split(":")[0].lower()
-    if host.endswith(HOST_SUFFIXES[svc]):
-        return host
-    return DEFAULT_HOSTS[svc]
+    host = clean_host(host)
+    return host if is_service_host(svc, host) else DEFAULT_HOSTS[svc]
 
 
 def notify_backends(app: web.Application) -> None:
@@ -80,7 +98,7 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
 
     if svc is None:
         safe_query = mask_query(raw_query, WU_SECRET_KEYS | WC_SECRET_KEYS)
-        log.info("404 %s host=%s path=%s%s", request.method, host.split(":")[0][:100],
+        log.info("404 %s host=%s path=%s%s", request.method, clean_host(host) or "-",
                  mask_wc_path(path)[:200], f"?{safe_query[:300]}" if safe_query else "")
         return web.Response(status=404, text="not found")
 
@@ -99,7 +117,7 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
     diag: dict[str, Any] = {
         "received_at": ts,
         "method": request.method,
-        "host": host.split(":")[0],
+        "host": clean_host(host) or None,
         "path": masked_path,
         "query": masked_query,
         "user_agent": request.headers.get("User-Agent"),

@@ -50,15 +50,20 @@ jobs:
           python-version: "3.12"
       - name: Resolve aioesphomeapi version
         id: ver
+        env:
+          TARGET: ${{ matrix.target }}
+          REASON: ${{ inputs.reason }}
         run: |
-          v=$(python scripts/esphome_versions.py ${{ matrix.target }})
+          v=$(python scripts/esphome_versions.py "$TARGET")
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "### ${{ matrix.target }}: aioesphomeapi $v" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "${{ inputs.reason }}" ]; then echo "Trigger: ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"; fi
+          echo "### $TARGET: aioesphomeapi $v" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$REASON" ]; then echo "Trigger: $REASON" >> "$GITHUB_STEP_SUMMARY"; fi
       - name: Install
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           pip install -r requirements-dev.txt
-          pip install "aioesphomeapi==${{ steps.ver.outputs.version }}"
+          pip install "aioesphomeapi==$VERSION"
           pip show aioesphomeapi | head -2
       - name: ESPHome backend tests
         run: pytest -q tests/test_esphome.py

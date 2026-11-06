@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+_IDENT = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_TOPIC = re.compile(r"[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*")
+
+
 def _bool(value: str | None, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
@@ -100,6 +104,13 @@ class Config:
     def validate(self) -> list[str]:
         """Return configuration errors that must stop the service."""
         errors = []
+        # Used in MQTT topics, unique ids and entity ids: no wildcards, separators or spaces.
+        if not _IDENT.fullmatch(self.device_id):
+            errors.append("DEVICE_ID must be 1-64 chars of A-Z, a-z, 0-9, '_' or '-'")
+        for name, value in (("BASE_TOPIC", self.base_topic), ("DISCOVERY_PREFIX", self.discovery_prefix)):
+            if not _TOPIC.fullmatch(value):
+                errors.append(f"{name} must be MQTT topic levels of A-Z, a-z, 0-9, '_' or '-' "
+                              "separated by '/' (no wildcards)")
         if not self.mqtt_enabled and not self.esphome_enabled:
             errors.append("No Home Assistant backend enabled: set MQTT_ENABLED=true and/or "
                           "ESPHOME_ENABLED=true in .env")

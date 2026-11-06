@@ -41,6 +41,15 @@ ESPHOME_VERSION = "2026.10.0"
 NOISE_PROTOCOL = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 NOISE_PROLOGUE = b"NoiseAPIInit"
 
+# Hello (and the Noise handshake) must complete within this time.
+HANDSHAKE_TIMEOUT = 10.0
+# HA pings every ~20 s (aioesphomeapi keepalive); a silent client is dropped after this.
+IDLE_TIMEOUT = 120.0
+# Concurrent connections (HA, ESPHome dashboard, a few CLI clients).
+MAX_CLIENTS = 8
+# A client that does not read its data is dropped once this much is buffered.
+MAX_WRITE_BUFFER = 256 * 1024
+
 CAT_NONE, CAT_CONFIG, CAT_DIAGNOSTIC = 0, 1, 2
 STATE_CLASS = {None: 0, "measurement": 1, "total_increasing": 2, "total": 3}
 
@@ -54,6 +63,10 @@ TEXT_SENSORS = (
     ("upstream_wu_status", "Upstream WU status", "", "mdi:cloud-check-outline"),
     ("upstream_wc_status", "Upstream WC status", "", "mdi:cloud-check-outline"),
 )
+
+
+# Messages a client may send before HelloRequest.
+PRE_HELLO = (pb.HelloRequest, pb.PingRequest, pb.DisconnectRequest)
 
 
 class ProtocolError(Exception):
@@ -166,6 +179,7 @@ class _Client:
     writer: asyncio.StreamWriter
     peer: str
     subscribed: bool = False
+    hello: bool = False
     listed: frozenset[str] = frozenset()
 
 
@@ -182,6 +196,11 @@ class ESPHomeServer:
         self._server: asyncio.Server | None = None
         self._zeroconf: Any = None
         self.port: int | None = None
+        # Connection hygiene (attributes so tests can shorten them).
+        self.handshake_timeout = HANDSHAKE_TIMEOUT
+        self.idle_timeout = IDLE_TIMEOUT
+        self.max_clients = MAX_CLIENTS
+        self._writers: set[asyncio.StreamWriter] = set()
 
     @property
     def encrypted(self) -> bool:
@@ -208,11 +227,15 @@ class ESPHomeServer:
                 await self._zeroconf.async_close()
             except Exception:  # pragma: no cover
                 pass
-        for c in list(self.clients):
-            c.writer.close()
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+        for w in list(self._writers):
+            w.close()
+        if self._server is not None:
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), 5)
+            except asyncio.TimeoutError:  # pragma: no cover
+                log.warning("ESPHome: connections did not close in time")
 
     async def _start_mdns(self, port: int) -> None:
         try:
@@ -320,6 +343,11 @@ class ESPHomeServer:
 
     def _send(self, c: _Client, msg: Message) -> None:
         try:
+            transport = c.writer.transport
+            if transport is not None and transport.get_write_buffer_size() > MAX_WRITE_BUFFER:
+                log.warning("ESPHome: client %s is not reading, dropping it", c.peer)
+                c.writer.close()
+                return
             c.frames.write(PROTO_TO_TYPE[type(msg)], msg.SerializeToString())
         except Exception as exc:
             log.debug("ESPHome send to %s failed: %s", c.peer, exc)
@@ -328,18 +356,26 @@ class ESPHomeServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = str(writer.get_extra_info("peername", ("?",))[0])
         client: _Client | None = None
+        if len(self._writers) >= self.max_clients:
+            log.warning("ESPHome: connection limit (%d) reached, rejecting %s", self.max_clients, peer)
+            writer.close()
+            return
+        self._writers.add(writer)
         try:
-            frames = await (self._noise_handshake(reader, writer) if self.encrypted
-                            else self._plain_start(reader, writer))
+            start = self._noise_handshake(reader, writer) if self.encrypted else self._plain_start(reader, writer)
+            frames = await asyncio.wait_for(start, self.handshake_timeout)
             if frames is None:
                 return
             client = _Client(frames, writer, peer)
             self.clients.add(client)
             while True:
-                msg_type, payload = await frames.read()
+                timeout = self.idle_timeout if client.hello else self.handshake_timeout
+                msg_type, payload = await asyncio.wait_for(frames.read(), timeout)
                 if not await self._dispatch(client, msg_type, payload):
                     break
                 await writer.drain()
+        except asyncio.TimeoutError:
+            log.info("ESPHome: closing inactive connection from %s", peer)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         except ProtocolError as exc:
@@ -351,6 +387,7 @@ class ESPHomeServer:
                 self.clients.discard(client)
                 if client.subscribed:
                     log.info("ESPHome: client %s disconnected", peer)
+            self._writers.discard(writer)
             writer.close()
 
     async def _plain_start(self, reader, writer) -> PlainFrames | None:
@@ -394,7 +431,12 @@ class ESPHomeServer:
 
     async def _dispatch(self, c: _Client, msg_type: int, payload: bytes) -> bool:
         cls = MESSAGE_TYPE_TO_PROTO.get(msg_type)
+        if not c.hello and cls not in PRE_HELLO:
+            log.warning("ESPHome: %s sent %s before HelloRequest; closing",
+                        c.peer, cls.__name__ if cls else msg_type)
+            return False
         if cls is pb.HelloRequest:
+            c.hello = True
             req = pb.HelloRequest.FromString(payload)
             log.debug("ESPHome: hello from %s (%s)", c.peer, req.client_info)
             self._send(c, pb.HelloResponse(api_version_major=API_VERSION[0],
