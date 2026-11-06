@@ -27,6 +27,7 @@ from noise.connection import NoiseConnection
 
 from . import __version__
 from .config import Config
+from .entities import FORWARD_SWITCHES, LAST_READING, UPSTREAM_STATUS
 from .parsing import FIELDS, FIELDS_BY_KEY
 from .state import ProxyState
 
@@ -52,18 +53,6 @@ MAX_WRITE_BUFFER = 256 * 1024
 
 CAT_NONE, CAT_CONFIG, CAT_DIAGNOSTIC = 0, 1, 2
 STATE_CLASS = {None: 0, "measurement": 1, "total_increasing": 2, "total": 3}
-
-SWITCHES = {
-    "wu": ("forward_to_wu", "Forward to WU"),
-    "wc": ("forward_to_weathercloud", "Forward to Weathercloud"),
-}
-TEXT_SENSORS = (
-    # object_id, name, device_class, icon
-    ("last_reading", "Last reading", "timestamp", ""),
-    ("upstream_wu_status", "Upstream WU status", "", "mdi:cloud-check-outline"),
-    ("upstream_wc_status", "Upstream WC status", "", "mdi:cloud-check-outline"),
-)
-
 
 # Messages a client may send before HelloRequest.
 PRE_HELLO = (pb.HelloRequest, pb.PingRequest, pb.DisconnectRequest)
@@ -294,14 +283,15 @@ class ESPHomeServer:
                 unit_of_measurement=self._units(f), accuracy_decimals=digits,
                 device_class=f.device_class or "", state_class=STATE_CLASS[f.state_class],
             ))
-        for oid, name, dclass, icon in TEXT_SENSORS:
+        text_sensors = [(LAST_READING, "timestamp")] + [(e, "") for e in UPSTREAM_STATUS.values()]
+        for ent, dclass in text_sensors:
             msgs.append(pb.ListEntitiesTextSensorResponse(
-                object_id=oid, key=entity_key(oid), name=name, icon=icon,
+                object_id=ent.object_id, key=entity_key(ent.object_id), name=ent.name, icon=ent.icon,
                 device_class=dclass, entity_category=CAT_DIAGNOSTIC,
             ))
-        for oid, name in SWITCHES.values():
+        for ent in FORWARD_SWITCHES.values():
             msgs.append(pb.ListEntitiesSwitchResponse(
-                object_id=oid, key=entity_key(oid), name=name, icon="mdi:cloud-upload-outline",
+                object_id=ent.object_id, key=entity_key(ent.object_id), name=ent.name, icon=ent.icon,
                 entity_category=CAT_CONFIG,
             ))
         return msgs
@@ -310,18 +300,15 @@ class ESPHomeServer:
         msgs: list[Message] = []
         for key in self.sensor_keys():
             msgs.append(pb.SensorStateResponse(key=entity_key(key), state=float(self.state.sensors[key])))
-        texts = {
-            "last_reading": self.state.last_reading,
-            "upstream_wu_status": self.state.upstream_status["wu"],
-            "upstream_wc_status": self.state.upstream_status["wc"],
-        }
+        texts = {LAST_READING.object_id: self.state.last_reading}
+        texts.update({e.object_id: self.state.upstream_status[svc] for svc, e in UPSTREAM_STATUS.items()})
         for oid, value in texts.items():
             if value is None:
                 msgs.append(pb.TextSensorStateResponse(key=entity_key(oid), missing_state=True))
             else:
                 msgs.append(pb.TextSensorStateResponse(key=entity_key(oid), state=str(value)))
-        for svc, (oid, _) in SWITCHES.items():
-            msgs.append(pb.SwitchStateResponse(key=entity_key(oid), state=self.state.forward(svc)))
+        for svc, ent in FORWARD_SWITCHES.items():
+            msgs.append(pb.SwitchStateResponse(key=entity_key(ent.object_id), state=self.state.forward(svc)))
         return msgs
 
     # ------------------------------------------------------------------ updates
@@ -463,8 +450,8 @@ class ESPHomeServer:
                 self._send(c, m)
         elif cls is pb.SwitchCommandRequest:
             req = pb.SwitchCommandRequest.FromString(payload)
-            for svc, (oid, _) in SWITCHES.items():
-                if req.key == entity_key(oid):
+            for svc, ent in FORWARD_SWITCHES.items():
+                if req.key == entity_key(ent.object_id):
                     self.state.set_forward(svc, bool(req.state))
                     log.info("Forward %s set to %s from ESPHome", svc.upper(), "ON" if req.state else "OFF")
                     if self.on_forward_change:

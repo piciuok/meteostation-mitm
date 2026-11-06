@@ -88,42 +88,9 @@ def _spawn(app: web.Application, coro) -> None:
     task.add_done_callback(app[TASKS].discard)
 
 
-async def handle_upload(request: web.Request) -> web.StreamResponse:
-    app = request.app
-    cfg, state, store = app[CFG], app[STATE], app[STORE]
-    host = request.headers.get("Host", "")
-    path = request.rel_url.raw_path
-    raw_query = request.rel_url.raw_query_string
-    svc = classify(host, path)
-
-    if svc is None:
-        safe_query = mask_query(raw_query, WU_SECRET_KEYS | WC_SECRET_KEYS)
-        log.info("404 %s host=%s path=%s%s", request.method, clean_host(host) or "-",
-                 mask_wc_path(path)[:200], f"?{safe_query[:300]}" if safe_query else "")
-        return web.Response(status=404, text="not found")
-
-    pairs = query_pairs(raw_query)
-    if svc == "wu":
-        secrets = secrets_from_query(pairs, WU_SECRET_KEYS)
-    else:
-        secrets = secrets_from_wc_path(path) + secrets_from_query(pairs, WC_SECRET_KEYS)
-    masked_path = mask_wc_path(path)
-    masked_query = mask_query(raw_query, WU_SECRET_KEYS | WC_SECRET_KEYS)
-    ts = now_iso()
-    state.requests[svc] += 1
-    state.last_seen[svc] = ts
-
-    # ---------------------------------------------------------------- parse + diagnostics
-    diag: dict[str, Any] = {
-        "received_at": ts,
-        "method": request.method,
-        "host": clean_host(host) or None,
-        "path": masked_path,
-        "query": masked_query,
-        "user_agent": request.headers.get("User-Agent"),
-        "remote": request.remote,
-    }
-    summary = ""
+def _parse(svc: str, path: str, pairs: list[tuple[str, str]], cfg: Config, state: ProxyState,
+           ts: str, diag: dict[str, Any]) -> str:
+    """Parse the upload into state (WU) or diagnostics (WC); return the log summary."""
     if svc == "wu":
         res = parse_wu(pairs, cfg.units)
         state.sensors.update(res.values)
@@ -139,19 +106,26 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
             "dateutc": res.dateutc,
             "values": res.values,
         })
-        summary = f"{len(res.values)} fields → HA"
         if res.invalid:
             log.warning("WU: rejected invalid values %s", res.invalid)
-    else:
-        res_wc = parse_wc(path, pairs)
-        diag.update({"pairs": res_wc.values, "unmapped_fields": sorted(res_wc.values)})
-        summary = f"{len(res_wc.values)} pairs (diagnostics only)"
+        return f"{len(res.values)} fields → HA"
+    res_wc = parse_wc(path, pairs)
+    diag.update({"pairs": res_wc.values, "unmapped_fields": sorted(res_wc.values)})
+    return f"{len(res_wc.values)} pairs (diagnostics only)"
 
-    # ---------------------------------------------------------------- forward / mock
+
+async def _forward_or_mock(app: web.Application, request: web.Request, svc: str, host: str,
+                           path: str, raw_query: str, secrets: list[str]) -> tuple[UpstreamResponse, str]:
+    """Forward to the real service when enabled; otherwise or on failure use the recording.
+
+    Returns the response for the console and a short outcome label for the log.
+    """
+    cfg, state, store = app[CFG], app[STATE], app[STORE]
     body = await request.read()
     resp: UpstreamResponse | None = None
-    outcome: str
-    if state.forward(svc):
+    if not state.forward(svc):
+        outcome = "mock (forward off)"
+    else:
         query = raw_query
         if svc == "wu" and (cfg.wu_username or cfg.wu_password):
             repl = {}
@@ -188,13 +162,56 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
             state.upstream_errors[svc] += 1
             log.error("%s forward crashed: %s", SVC_LABEL[svc], redact(repr(exc), secrets)[:300])
             outcome = "proxy error, mock"
-    else:
-        outcome = "mock (forward off)"
 
     if resp is None:
         rec = store.get(svc)
         resp = UpstreamResponse(int(rec.get("status", 200)), str(rec.get("content_type", "text/plain")),
                                 str(rec.get("body", "")).encode("utf-8"))
+    return resp, outcome
+
+
+def _web_response(resp: UpstreamResponse) -> web.Response:
+    ctype = resp.content_type.split(";")[0].strip() or "text/plain"
+    charset = None
+    if "charset=" in resp.content_type:
+        charset = resp.content_type.split("charset=")[-1].split(";")[0].strip()
+    return web.Response(status=resp.status, body=resp.body, content_type=ctype, charset=charset)
+
+
+async def handle_upload(request: web.Request) -> web.StreamResponse:
+    app = request.app
+    cfg, state = app[CFG], app[STATE]
+    host = request.headers.get("Host", "")
+    path = request.rel_url.raw_path
+    raw_query = request.rel_url.raw_query_string
+    svc = classify(host, path)
+
+    if svc is None:
+        safe_query = mask_query(raw_query, WU_SECRET_KEYS | WC_SECRET_KEYS)
+        log.info("404 %s host=%s path=%s%s", request.method, clean_host(host) or "-",
+                 mask_wc_path(path)[:200], f"?{safe_query[:300]}" if safe_query else "")
+        return web.Response(status=404, text="not found")
+
+    pairs = query_pairs(raw_query)
+    if svc == "wu":
+        secrets = secrets_from_query(pairs, WU_SECRET_KEYS)
+    else:
+        secrets = secrets_from_wc_path(path) + secrets_from_query(pairs, WC_SECRET_KEYS)
+    ts = now_iso()
+    state.requests[svc] += 1
+    state.last_seen[svc] = ts
+
+    diag: dict[str, Any] = {
+        "received_at": ts,
+        "method": request.method,
+        "host": clean_host(host) or None,
+        "path": mask_wc_path(path),
+        "query": mask_query(raw_query, WU_SECRET_KEYS | WC_SECRET_KEYS),
+        "user_agent": request.headers.get("User-Agent"),
+        "remote": request.remote,
+    }
+    summary = _parse(svc, path, pairs, cfg, state, ts, diag)
+    resp, outcome = await _forward_or_mock(app, request, svc, host, path, raw_query, secrets)
 
     diag["response"] = {"source": outcome, "status": resp.status}
     try:
@@ -206,12 +223,7 @@ async def handle_upload(request: web.Request) -> web.StreamResponse:
 
     log.info("%s: %s, %s", SVC_LABEL[svc], summary, outcome)
     notify_backends(app)
-
-    ctype = resp.content_type.split(";")[0].strip() or "text/plain"
-    charset = None
-    if "charset=" in resp.content_type:
-        charset = resp.content_type.split("charset=")[-1].split(";")[0].strip()
-    return web.Response(status=resp.status, body=resp.body, content_type=ctype, charset=charset)
+    return _web_response(resp)
 
 
 async def handle_health(request: web.Request) -> web.Response:

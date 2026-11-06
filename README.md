@@ -64,8 +64,8 @@ The upstream project used Flask with a fire-and-forget `requests` call and a wri
 paho client. This fork needs three things running at once: an upstream request whose
 response goes back to the console, a long-lived MQTT subscription for the switches, and
 reconnects with backoff. `aiohttp` + `aiomqtt` handle all three in one asyncio loop without
-threads. MQTT publishing runs in the background, so a slow or absent broker never delays
-the console's response.
+threads. The ESPHome Native API server runs in the same loop. Publishing to Home Assistant
+runs in the background, so a slow or absent broker/client never delays the console's response.
 
 ---
 
@@ -190,6 +190,8 @@ every variable). `docker-compose.yml` only wires the environment together and co
 | `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
 | `BASE_TOPIC` | `meteo_proxy` | state / status / command topics |
 | `UNITS` | `metric` | `imperial` publishes the raw WU units (°F, mph, in, inHg) |
+| `HTTP_PORT` | `80` | HTTP port inside the container |
+| `DATA_DIR` | `/data` | data directory inside the container |
 | `TZ` | – | container time zone (logs) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -209,9 +211,22 @@ every variable). `docker-compose.yml` only wires the environment together and co
   parser error that quotes the raw request line.
 * Logging: one INFO line per request (`WU: 14 fields → HA, forward 200`). Upstream failures
   and fallbacks to the recorded response are logged at WARNING.
-* `GET /healthz` returns JSON: `ok`, enabled backends, `mqtt_connected`, `esphome_clients`, forward state, counters, `last_seen`,
-  last upstream statuses. The image `HEALTHCHECK` uses it. The container stays healthy while
-  MQTT is down, because serving the console is the critical path.
+* `GET /healthz` returns JSON: `ok`, enabled backends, `mqtt_connected`, `esphome_clients`,
+  forward state, counters, `last_seen`, last upstream statuses. The image `HEALTHCHECK` uses
+  it. The container stays healthy while MQTT is down, because serving the console is the
+  critical path.
+
+### Hardening
+
+| Area | Measure |
+|---|---|
+| Forwarding | Only to the service's own domain: the `Host` header is normalised (bare DNS name, no path/userinfo) and must be the domain or a subdomain of `wunderground.com` / `weathercloud.net`, otherwise the default host is used. The proxy cannot be used to reach other hosts. |
+| Upstream | Response bodies over 64 KiB are treated as an upstream error (mock served, nothing recorded). Upstream DNS only via `UPSTREAM_DNS`. |
+| ESPHome API | Optional Noise encryption (recommended: without a key anyone in the LAN can connect and toggle the forward switches). HelloRequest must come first and within 10 s, idle clients are dropped after 120 s, at most 8 connections, clients that do not read their data are dropped. |
+| MQTT | Use a dedicated HA user (`meteo_proxy`); restrict it with Mosquitto ACLs to `meteo_proxy/#` and `homeassistant/#` if your broker supports it. `DEVICE_ID`, `BASE_TOPIC`, `DISCOVERY_PREFIX` are validated (no wildcards or separators). |
+| Container | The entrypoint hands `/data` to uid 10001 and drops root via `setpriv`; the app keeps only `CAP_NET_BIND_SERVICE` (port 80). The compose files add `read_only`, `no-new-privileges` and `cap_drop: ALL` (+ the four caps the entrypoint needs). Data written by older root-run versions is re-owned on start. |
+| Secrets | Only in `.env` (git-ignored): `MQTT_PASSWORD`, `ESPHOME_ENCRYPTION_KEY`, optional `WU_PASSWORD`. Station credentials from the console are masked everywhere. |
+| CI | Version strings from PyPI/GitHub are validated before use in shell steps; workflow inputs reach `run:` blocks only through `env`. |
 
 ---
 
@@ -468,7 +483,10 @@ The tests use a local fake upstream HTTP server, a fake MQTT client and the real
 `aioesphomeapi` client. They cover conversions, case-insensitive fields, WC path parsing,
 masking across logs, files and MQTT, forward on/off, upstream down or timeout, MQTT and ESPHome
 switch toggling with persistence, MQTT discovery payloads, and the ESPHome Native API
-(plaintext, Noise, wrong key, entity list, state push, re-list on new fields).
+(plaintext, Noise, wrong key, entity list, state push, re-list on new fields), and security
+regressions (Host header smuggling, oversized upstream bodies, unsafe MQTT identifiers,
+ESPHome connection hygiene, CI version-string validation). `pytest-timeout` fails a hanging
+test after 30 s.
 
 CI:
 
@@ -490,8 +508,12 @@ Code layout:
 | `weatherbridge/upstream.py` | resolver via `UPSTREAM_DNS`, forwarder, recorded responses |
 | `weatherbridge/mqtt.py` | MQTT backend: HA discovery, state publishing, switch commands, reconnect |
 | `weatherbridge/esphome.py` | ESPHome backend: Native API server (plaintext/Noise), entities, mDNS |
+| `weatherbridge/entities.py` | non-weather entities shared by both backends (switches, diagnostics) |
+| `weatherbridge/config.py` | configuration from environment + validation |
 | `weatherbridge/state.py` | runtime state + `data/state.json` |
 | `weatherbridge/logsafe.py` | global log scrubbing of credentials |
+| `docker-entrypoint.sh` | fixes `/data` ownership, drops root |
+| `scripts/esphome_versions.py` | resolves `aioesphomeapi` versions for the compatibility CI |
 
 ---
 

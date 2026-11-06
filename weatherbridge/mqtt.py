@@ -9,21 +9,11 @@ from typing import Any, Callable, Protocol
 
 from . import __version__
 from .config import Config
+from .entities import FORWARD_SWITCHES, LAST_READING, UPSTREAM_STATUS
 from .parsing import FIELDS_BY_KEY
 from .state import ProxyState
 
 log = logging.getLogger(__name__)
-
-SWITCHES = {
-    # svc: (object id suffix, entity name)
-    "wu": ("forward_to_wu", "Forward to WU"),
-    "wc": ("forward_to_weathercloud", "Forward to Weathercloud"),
-}
-STATUS_SENSORS = {
-    "wu": ("upstream_wu_status", "Upstream WU status"),
-    "wc": ("upstream_wc_status", "Upstream WC status"),
-}
-
 
 class Publisher(Protocol):
     async def publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False) -> Any: ...
@@ -41,7 +31,7 @@ class HABridge:
         base = cfg.base_topic
         self.state_topic = f"{base}/state"
         self.status_topic = f"{base}/status"
-        self.command_topics = {svc: f"{base}/forward/{svc}/set" for svc in SWITCHES}
+        self.command_topics = {svc: f"{base}/forward/{svc}/set" for svc in FORWARD_SWITCHES}
         self.ha_status_topic = f"{cfg.discovery_prefix}/status"
 
     @property
@@ -92,7 +82,7 @@ class HABridge:
 
     def static_discovery(self) -> list[tuple[str, dict[str, Any]]]:
         out = []
-        p = self._common("sensor", "last_reading", "Last reading")
+        p = self._common("sensor", LAST_READING.object_id, LAST_READING.name)
         p.update({
             "device_class": "timestamp",
             "entity_category": "diagnostic",
@@ -100,20 +90,22 @@ class HABridge:
             "json_attributes_topic": self.state_topic,
             "json_attributes_template": "{{ value_json.diag | tojson }}",
         })
-        out.append((self._topic("sensor", "last_reading"), p))
-        for svc, (oid, name) in STATUS_SENSORS.items():
-            p = self._common("sensor", oid, name)
+        out.append((self._topic("sensor", LAST_READING.object_id), p))
+        for svc, ent in UPSTREAM_STATUS.items():
+            oid = ent.object_id
+            p = self._common("sensor", oid, ent.name)
             p.update({
                 "entity_category": "diagnostic",
-                "icon": "mdi:cloud-check-outline",
+                "icon": ent.icon,
                 "value_template": f"{{{{ value_json.upstream.{svc} }}}}",
             })
             out.append((self._topic("sensor", oid), p))
-        for svc, (oid, name) in SWITCHES.items():
-            p = self._common("switch", oid, name)
+        for svc, ent in FORWARD_SWITCHES.items():
+            oid = ent.object_id
+            p = self._common("switch", oid, ent.name)
             p.update({
                 "entity_category": "config",
-                "icon": "mdi:cloud-upload-outline",
+                "icon": ent.icon,
                 "command_topic": self.command_topics[svc],
                 "payload_on": "ON",
                 "payload_off": "OFF",
