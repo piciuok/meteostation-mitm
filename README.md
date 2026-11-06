@@ -109,6 +109,13 @@ One device: `identifiers: [weather_station]`, name `Weather Station`, model `VEV
   names also slugify to the same IDs (`Humidity` → `humidity`), so the result is the same
   on older versions.
 
+### Home Assistant package (optional)
+
+[`homeassistant/weather_station.yaml`](homeassistant/weather_station.yaml) adds
+`sensor.weather_station_pressure_change_3h` (statistics `change` over 3 h of the relative
+pressure). Copy it to `/config/packages/` (requires `packages: !include_dir_named packages`
+under `homeassistant:` in `configuration.yaml`), check the configuration and restart HA.
+
 ### MQTT topics
 
 | Topic | Content |

@@ -1,0 +1,18 @@
+# Home Assistant package for the VEVOR weatherbridge.
+# Copy to /config/packages/weather_station.yaml and make sure configuration.yaml has:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# Entity IDs assume DEVICE_ID=weather_station.
+
+sensor:
+  # Pressure change over the last 3 hours (hPa), input for local forecasts (e.g. Zambretti)
+  # and "pressure drop > 3 hPa/3h" alerts.
+  - platform: statistics
+    name: "Weather Station pressure change 3h"
+    unique_id: weather_station_pressure_change_3h
+    entity_id: sensor.weather_station_relative_pressure
+    state_characteristic: change
+    max_age:
+      hours: 3
+    sampling_size: 500
+    precision: 1
