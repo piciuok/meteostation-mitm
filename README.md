@@ -1,12 +1,14 @@
-# VEVOR Weatherbridge
+# VEVOR Weatherbridge – local Weather Underground / Weathercloud proxy for Home Assistant
 
 [![CI](https://github.com/piciuok/meteostation-mitm/actions/workflows/ci.yml/badge.svg)](https://github.com/piciuok/meteostation-mitm/actions/workflows/ci.yml)
 [![ESPHome compatibility](https://github.com/piciuok/meteostation-mitm/actions/workflows/esphome-compat.yml/badge.svg)](https://github.com/piciuok/meteostation-mitm/actions/workflows/esphome-compat.yml)
 
-Local proxy for VEVOR weather station consoles (tested: **YT60234**; any console using the
-Weather Underground upload protocol). It intercepts the console's uploads to Weather
-Underground (WU) and Weathercloud (WC) and brings the data into **Home Assistant**, with or
-without the cloud.
+Local proxy for VEVOR Wi-Fi weather station consoles (tested: **VEVOR YT60234** 7-in-1; any
+personal weather station (PWS) console that uploads with the Weather Underground protocol,
+`updateweatherstation.php`). It intercepts the console's uploads to Weather Underground (WU)
+and Weathercloud (WC) by DNS redirection and brings the data into **Home Assistant**, with or
+without the cloud. Runs as a Docker container (e.g. on UnRAID); no firmware changes, no
+SDR/rtl_433 receiver needed.
 
 * **Home Assistant** as an **ESPHome device** (no broker needed) and/or via **MQTT discovery**,
   in metric units.
