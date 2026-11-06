@@ -28,7 +28,7 @@ services:
       wud.watch: "false"   # locally built image, nothing to watch in a registry
     networks:
       lan:
-        ipv4_address: ${CONTAINER_IP:-192.168.10.200}
+        ipv4_address: ${CONTAINER_IP:-192.168.1.200}
 
 networks:
   lan:
